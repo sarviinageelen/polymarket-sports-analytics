@@ -1,6 +1,6 @@
 # Polymarket Sports Analytics
 
-A comprehensive analytics platform for tracking and analyzing sports prediction market performance on [Polymarket](https://polymarket.com). This tool aggregates on-chain trading data, calculates performance metrics, and generates interactive leaderboards to identify top forecasters across NFL, NBA, CFB, and CBB markets.
+Analytics for tracking and analyzing sports prediction market performance on [Polymarket](https://polymarket.com). This tool aggregates on-chain trading data, calculates performance metrics, and generates interactive leaderboards to identify top forecasters across NFL, NBA, CFB, and CBB markets.
 
 ## Overview
 
