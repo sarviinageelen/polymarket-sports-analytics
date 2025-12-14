@@ -328,8 +328,14 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     print("Computing streaks...")
     streak_time = time.time()
 
-    # Sort by user and time descending for streak calculation
-    df_sorted = df.sort_values([sort_col], ascending=False)
+    # Filter to resolved games only for streak calculation (exclude pending)
+    df_resolved = df[df['result'].isin(['won', 'lost'])].copy()
+    # Sort by time descending, then by is_correct_pick ascending (losses first)
+    # This ensures losses break streaks correctly when multiple games have same timestamp
+    df_sorted = df_resolved.sort_values(
+        [sort_col, 'is_correct_pick'],
+        ascending=[False, True]  # Most recent first, losses (False) before wins (True)
+    )
 
     # Calculate streaks using groupby
     def calc_streaks(group):
@@ -394,44 +400,6 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
         stats_df['last_10_games'] = 0
 
     print(f"   Last 10 computed in {time.time() - last10_time:.1f}s")
-
-    # ==========================================================================
-    # Calculate Underdog Wins (picks against consensus that won)
-    # ==========================================================================
-    print("Computing underdog wins...")
-    underdog_time = time.time()
-
-    # Calculate consensus (majority pick) per game
-    game_picks = df.groupby(['game', 'user_pick']).size().reset_index(name='pick_count')
-    game_totals = df.groupby('game').size().reset_index(name='total_picks')
-    game_picks = game_picks.merge(game_totals, on='game')
-    game_picks['pick_pct'] = game_picks['pick_count'] / game_picks['total_picks']
-
-    # Find majority pick per game (the pick with > 50% consensus)
-    majority_picks = game_picks.loc[game_picks.groupby('game')['pick_count'].idxmax()][['game', 'user_pick']]
-    majority_picks.columns = ['game', 'majority_pick']
-
-    # Merge majority pick info back to main df
-    df_with_majority = df.merge(majority_picks, on='game', how='left')
-
-    # Identify underdog picks (user picked differently than majority)
-    df_with_majority['is_underdog_pick'] = df_with_majority['user_pick'] != df_with_majority['majority_pick']
-
-    # Calculate underdog stats per user (only for resolved games)
-    resolved_with_majority = df_with_majority[df_with_majority['result'].isin(['won', 'lost'])]
-
-    underdog_stats = resolved_with_majority.groupby('user_address').agg(
-        underdog_picks=('is_underdog_pick', 'sum'),
-        underdog_wins=('is_underdog_pick', lambda x: ((resolved_with_majority.loc[x.index, 'is_underdog_pick']) &
-                                                       (resolved_with_majority.loc[x.index, 'result'] == 'won')).sum())
-    ).reset_index()
-
-    # Merge with stats_df
-    stats_df = stats_df.merge(underdog_stats, on='user_address', how='left')
-    stats_df['underdog_picks'] = stats_df['underdog_picks'].fillna(0).astype(int)
-    stats_df['underdog_wins'] = stats_df['underdog_wins'].fillna(0).astype(int)
-
-    print(f"   Underdog wins computed in {time.time() - underdog_time:.1f}s")
 
     # ==========================================================================
     # OPTIMIZED: Vectorized pivot for picks
@@ -532,14 +500,13 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     ws = wb.active
     ws.title = title[:31]
 
-    # Define columns to write (order: rank, user_address, games, wins, losses, win_pct, win_streak, last_10, underdog, then game columns)
-    stats_cols = ["rank", "user_address", "games", "wins", "losses", "win_pct", "win_streak", "last_10", "underdog"]
+    # Define columns to write (order: rank, user_address, games, wins, losses, win_pct, win_streak, last_10, then game columns)
+    stats_cols = ["rank", "user_address", "games", "wins", "losses", "win_pct", "win_streak", "last_10"]
     display_cols = stats_cols + games
     num_stats_cols = len(stats_cols)
 
-    # Create display columns for last_10 and underdog (just the wins count)
+    # Create display column for last_10 (just the wins count)
     result_df["last_10"] = result_df["last_10_wins"].fillna(0).astype(int)
-    result_df["underdog"] = result_df["underdog_wins"].fillna(0).astype(int)
 
     # Header display names mapping
     header_names = {
@@ -551,7 +518,6 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
         "win_pct": "win %",
         "win_streak": "win streak",
         "last_10": "last 10",
-        "underdog": "underdog",
     }
 
     center_align = Alignment(horizontal="center")
@@ -686,8 +652,8 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     print(f"   Writing row {total_rows:,}/{total_rows:,} (100.0%)")
     print(f"   Excel rows written in {time.time() - excel_time:.1f}s")
 
-    # Add freeze pane after underdog column and header rows (column J, row 7)
-    ws.freeze_panes = "J7"
+    # Add freeze pane after last_10 column and header rows (column I, row 7)
+    ws.freeze_panes = "I7"
 
     # Save
     print("Saving file...")
@@ -699,10 +665,10 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     print("\n" + "="*80)
     print("PREVIEW (Top 10)")
     print("="*80)
-    preview_cols = ["rank", "user_address", "games", "wins", "losses", "win_pct", "last_10", "underdog"]
+    preview_cols = ["rank", "user_address", "games", "wins", "losses", "win_pct", "last_10"]
     preview_df = result_df[preview_cols].head(10).copy()
     preview_df["user_address"] = preview_df["user_address"].apply(lambda x: x[:18] + "..." if len(str(x)) > 20 else x)
-    preview_df.columns = ["rank", "user_address", "games", "wins", "loss", "win %", "last 10", "underdog"]
+    preview_df.columns = ["rank", "user_address", "games", "wins", "loss", "win %", "last 10"]
     print(preview_df.to_string(index=False))
 
     total_time = time.time() - start_time
