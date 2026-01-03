@@ -100,7 +100,7 @@ PNL_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201
 ORDERBOOK_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
 # USDC token has 6 decimal places
-# All amounts from subgraph are in base units (multiply by 10^6)
+# All amounts from subgraph are in base units (divide by 10^6 to get USDC)
 COLLATERAL_SCALE = 1_000_000
 
 # Rate Limiting Configuration

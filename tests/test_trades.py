@@ -66,9 +66,34 @@ class TestDetermineUserPick:
         yes_pos = {"totalBought": "0"}
         no_pos = {"totalBought": "0"}
         match_title = "Chiefs vs Raiders"
-        
+
         result = determine_user_pick(yes_pos, no_pos, match_title)
         assert result == "NONE"
+
+    def test_period_separator_in_vs(self):
+        """Code handles 'vs.' by replacing with 'vs' - verify this works"""
+        yes_pos = {"totalBought": "1000"}
+        no_pos = {"totalBought": "100"}
+        match_title = "Chiefs vs. Raiders"  # Note the period
+
+        result = determine_user_pick(yes_pos, no_pos, match_title)
+        assert result == "Chiefs"
+
+    def test_empty_match_title(self):
+        """Empty title should fall back to YES/NO"""
+        yes_pos = {"totalBought": "1000"}
+        no_pos = {"totalBought": "100"}
+
+        result = determine_user_pick(yes_pos, no_pos, "")
+        assert result == "YES"
+
+    def test_malformed_match_title(self):
+        """Title without 'vs' should fall back to YES/NO"""
+        yes_pos = {"totalBought": "1000"}
+        no_pos = {"totalBought": "100"}
+
+        result = determine_user_pick(yes_pos, no_pos, "Some Random Title")
+        assert result == "YES"
 
 
 class TestCalculateIsCorrectPick:

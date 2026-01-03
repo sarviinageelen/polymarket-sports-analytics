@@ -55,7 +55,6 @@ This project interfaces with Polymarket's Gamma API and GraphQL subgraphs to:
 - **P&L Calculations**: Realized, unrealized, and total profit/loss per position
 - **Accuracy Tracking**: Historical and rolling (last 10 games) performance metrics
 - **Streak Analysis**: Current, max winning, and max losing streak calculations
-- **Underdog Detection**: Identifies picks on teams with <40% implied probability
 - **Timing Analysis**: Filters late entries (>95% probability) to ensure quality signals
 
 ### Leaderboard Generation
@@ -225,9 +224,8 @@ The generated Excel file contains:
 | wins | Correct predictions |
 | losses | Incorrect predictions |
 | win_pct | Accuracy percentage |
+| win_streak | Current winning streak |
 | last_10 | Correct in last 10 games |
-| underdog | Underdog wins |
-| profit | Total profit (USDC) |
 | [Game columns] | Pick for each game (team name) |
 
 ## Filtering Logic
