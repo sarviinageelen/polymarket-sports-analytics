@@ -103,9 +103,10 @@ python update_markets.py
 # Step 2: Calculate P&L for all traders
 python update_trades.py
 
-# Step 3: Generate leaderboards
-python update_picks.py --sport NBA --start-week 1 --end-week 8
+# Step 3: Generate leaderboards (interactive prompts)
+python update_picks.py
 ```
+Follow the prompts to select sport and time period.
 
 ### Command Line Options
 
@@ -129,20 +130,14 @@ Options:
 
 #### update_picks.py
 ```bash
-python update_picks.py [OPTIONS]
-
-Options:
-  --sport SPORT        Sport to analyze: NFL, NBA, CFB, CBB (default: NBA)
-  --start-week N       Starting week number (default: 1)
-  --end-week N         Ending week number (default: current week)
+python update_picks.py
 ```
+Runs an interactive menu to choose sport and time window (latest week, previous week, last 5 weeks, full season).
 
 ### Example Workflows
 
-**Generate NBA leaderboard for weeks 4-8:**
-```bash
-python update_picks.py --sport NBA --start-week 4 --end-week 8
-```
+**Generate NBA leaderboard for the last 5 weeks:**
+Run `python update_picks.py`, select NBA, then choose "Last 5 weeks".
 
 **Refresh only active markets:**
 ```bash
@@ -151,7 +146,7 @@ python update_trades.py --unresolved-only
 
 **Full pipeline refresh:**
 ```bash
-python update_markets.py && python update_trades.py --force-reprocess && python update_picks.py --sport NBA
+python update_markets.py && python update_trades.py --force-reprocess && python update_picks.py
 ```
 
 ## API Integration

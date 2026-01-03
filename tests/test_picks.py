@@ -9,6 +9,7 @@ import numpy as np
 from update_picks import (
     safe_divide,
     fmt,
+    load_and_transform,
     calculate_streaks,
     calculate_time_window_stats,
     calculate_bet_price_stats,
@@ -56,6 +57,34 @@ class TestColumnDefinitions:
         required = ['user_address', 'condition_id', 'match_title', 'position', 'size']
         for col in required:
             assert col in ACTIVE_COLUMNS, f"Missing column: {col}"
+
+
+class TestLoadAndTransform:
+    def test_string_is_correct_pick_values(self, tmp_path):
+        df = pd.DataFrame({
+            "game_start_time": [
+                "2025-09-10 12:00:00",
+                "2025-09-10 12:00:00",
+                "2025-09-10 12:00:00",
+            ],
+            "match_title": [
+                "Chiefs vs Raiders",
+                "Chiefs vs Raiders",
+                "Chiefs vs Raiders",
+            ],
+            "is_correct_pick": ["TRUE", "FALSE", ""],
+            "user_pick": ["Chiefs", "Raiders", "Chiefs"],
+            "yes_avg_price": [0.5, 0.5, 0.5],
+            "no_avg_price": [0.4, 0.4, 0.4],
+            "user_address": ["0x1", "0x1", "0x1"],
+        })
+
+        csv_path = tmp_path / "trades.csv"
+        df.to_csv(csv_path, index=False)
+
+        result = load_and_transform(str(csv_path))
+
+        assert result["result"].tolist() == ["won", "lost", "pending"]
 
 
 class TestSafeDivide:

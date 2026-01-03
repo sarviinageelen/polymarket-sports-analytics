@@ -41,6 +41,9 @@ SPORTS_CONFIG = {
     },
 }
 
+# Cache of latest week found in CSVs to avoid repeated reads.
+_MAX_WEEK_CACHE = {}
+
 # Colors
 GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
@@ -52,6 +55,36 @@ HEADER_FONT = Font(color="FFFFFF", bold=True)
 # =============================================================================
 # Schedule Functions
 # =============================================================================
+
+def get_csv_max_week(sport: str) -> int:
+    """
+    Get max week number implied by latest game_start_time in the CSV.
+    Returns 0 if the file is missing or has no valid dates.
+    """
+    if sport in _MAX_WEEK_CACHE:
+        return _MAX_WEEK_CACHE[sport]
+
+    config = SPORTS_CONFIG[sport]
+    input_csv = config["input_csv"]
+    season_start = config["season_start"]
+    max_week = 0
+
+    if os.path.exists(input_csv):
+        try:
+            dates_df = pd.read_csv(input_csv, usecols=["game_start_time"])
+            game_dates = pd.to_datetime(
+                dates_df["game_start_time"].astype(str).str[:10],
+                errors="coerce",
+            )
+            max_date = game_dates.max()
+            if pd.notna(max_date) and max_date >= season_start:
+                max_week = ((max_date - season_start).days // 7) + 1
+        except Exception:
+            max_week = 0
+
+    _MAX_WEEK_CACHE[sport] = max_week
+    return max_week
+
 
 def get_week_dates(week: int, sport: str) -> Tuple[str, str]:
     """
@@ -67,9 +100,10 @@ def get_week_dates(week: int, sport: str) -> Tuple[str, str]:
     config = SPORTS_CONFIG[sport]
     total_weeks = config["total_weeks"]
     season_start = config["season_start"]
+    max_weeks = max(total_weeks, get_csv_max_week(sport))
 
-    if week < 1 or week > total_weeks:
-        raise ValueError(f"Week must be between 1 and {total_weeks}, got {week}")
+    if week < 1 or week > max_weeks:
+        raise ValueError(f"Week must be between 1 and {max_weeks}, got {week}")
 
     # Each week is 7 days
     week_offset = (week - 1) * 7
@@ -93,6 +127,7 @@ def get_current_week(sport: str) -> int:
     config = SPORTS_CONFIG[sport]
     season_start = config["season_start"]
     total_weeks = config["total_weeks"]
+    week_from_csv = get_csv_max_week(sport)
 
     today = datetime.now()
 
@@ -102,10 +137,14 @@ def get_current_week(sport: str) -> int:
 
     # Calculate days since season start
     days_elapsed = (today - season_start).days
-    current_week = (days_elapsed // 7) + 1
+    week_from_today = (days_elapsed // 7) + 1
 
-    # Cap at total weeks
-    return min(current_week, total_weeks)
+    # Use latest CSV week when available to avoid jumping ahead of data.
+    if week_from_csv > 0:
+        return min(week_from_today, week_from_csv)
+
+    # Fall back to configured season length if CSV data is unavailable.
+    return min(week_from_today, total_weeks)
 
 
 def get_last_n_weeks(n: int, sport: str) -> List[int]:
@@ -154,8 +193,28 @@ def load_and_transform(input_csv: str) -> pd.DataFrame:
     df['game'] = df['match_title'] + ' (' + df['game_date'] + ')'
 
     # Map is_correct_pick to result
-    # Values are boolean True/False or NaN
-    df['result'] = df['is_correct_pick'].map({True: 'won', False: 'lost'}).fillna('pending')
+    # Values can be booleans or "TRUE"/"FALSE" strings from CSV.
+    def normalize_is_correct(value):
+        if pd.isna(value):
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized in ("TRUE", "1"):
+                return True
+            if normalized in ("FALSE", "0"):
+                return False
+        return None
+
+    normalized_is_correct = df['is_correct_pick'].apply(normalize_is_correct)
+    df['is_correct_pick'] = normalized_is_correct
+    df['result'] = normalized_is_correct.map({True: 'won', False: 'lost'}).fillna('pending')
 
     print(f"   Transformed {len(df):,} rows")
 
@@ -514,7 +573,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
         "user_address": "user_address",
         "games": "games",
         "wins": "wins",
-        "losses": "loss",
+        "losses": "losses",
         "win_pct": "win %",
         "win_streak": "win streak",
         "last_10": "last 10",
@@ -668,7 +727,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     preview_cols = ["rank", "user_address", "games", "wins", "losses", "win_pct", "last_10"]
     preview_df = result_df[preview_cols].head(10).copy()
     preview_df["user_address"] = preview_df["user_address"].apply(lambda x: x[:18] + "..." if len(str(x)) > 20 else x)
-    preview_df.columns = ["rank", "user_address", "games", "wins", "loss", "win %", "last 10"]
+    preview_df.columns = ["rank", "user_address", "games", "wins", "losses", "win %", "last 10"]
     print(preview_df.to_string(index=False))
 
     total_time = time.time() - start_time
