@@ -516,6 +516,11 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     # Add freeze pane after last_10 column and header rows (column I, row 7)
     ws.freeze_panes = "I7"
 
+    # Set column widths - game columns (I onwards) get minimum width of 10
+    for col_idx in range(num_stats_cols + 1, len(display_cols) + 1):
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = 10
+
     # Save
     print("Saving file...")
     save_time = time.time()
