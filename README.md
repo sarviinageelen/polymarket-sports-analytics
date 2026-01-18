@@ -1,6 +1,6 @@
 # Polymarket Sports Analytics
 
-Analytics for tracking and analyzing sports prediction market performance on [Polymarket](https://polymarket.com). This tool aggregates on-chain trading data, calculates performance metrics, and generates interactive leaderboards to identify top forecasters across NFL, NBA, CFB, and CBB markets.
+Analytics for tracking and analyzing sports prediction market performance on [Polymarket](https://polymarket.com). This tool aggregates on-chain trading data, calculates performance metrics, and generates interactive leaderboards and analysis reports to identify top forecasters across NFL, NBA, CFB, and CBB markets.
 
 ## Overview
 
@@ -9,6 +9,7 @@ This project interfaces with Polymarket's Gamma API and GraphQL subgraphs to:
 - **Fetch Market Data**: Retrieve moneyline prediction markets across multiple sports leagues
 - **Calculate Performance**: Process on-chain position data to compute realized and unrealized P&L
 - **Rank Forecasters**: Apply sophisticated filtering and generate performance leaderboards
+- **Analyze Picks**: Generate flat-table analysis with per-pick details and consensus metrics
 - **Export Analytics**: Produce Excel workbooks with conditional formatting and interactive features
 
 ## Architecture
@@ -27,16 +28,17 @@ This project interfaces with Polymarket's Gamma API and GraphQL subgraphs to:
 │  ┌──────────────────────────────────────────────────────────────┐          │
 │  │                     Data Pipeline                             │          │
 │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐              │          │
-│  │  │  Markets   │─▶│   Trades   │─▶│   Picks    │              │          │
-│  │  │  Fetcher   │  │ Calculator │  │  Analyzer  │              │          │
+│  │  │  Markets   │─▶│   Trades   │─▶│   Picks/   │              │          │
+│  │  │  Fetcher   │  │ Calculator │  │  Analyze   │              │          │
 │  │  └────────────┘  └────────────┘  └────────────┘              │          │
 │  └──────────────────────────────────────────────────────────────┘          │
 │                              │                                              │
 │                              ▼                                              │
 │  ┌──────────────────────────────────────────────────────────────┐          │
 │  │                     Output Layer                              │          │
-│  │  • CSV databases (markets, trades, picks)                    │          │
+│  │  • CSV databases (markets, trades by sport)                  │          │
 │  │  • Excel leaderboards with conditional formatting            │          │
+│  │  • Excel flat-table analysis with per-pick details           │          │
 │  │  • Clickable Polymarket profile links                        │          │
 │  └──────────────────────────────────────────────────────────────┘          │
 │                                                                              │
@@ -83,17 +85,20 @@ pip install -r requirements.txt
 
 ### Dependencies
 ```
-pandas>=2.0.0
 requests>=2.28.0
-openpyxl>=3.1.0
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
 python-dateutil>=2.8.0
+openpyxl>=3.1.0
+pytest>=7.0.0
 ```
 
 ## Usage
 
 ### Quick Start
 
-Run the three scripts in sequence to generate a complete leaderboard:
+Run the scripts in sequence to generate leaderboards and analysis:
 
 ```bash
 # Step 1: Fetch market data from Polymarket
@@ -104,6 +109,9 @@ python update_trades.py
 
 # Step 3: Generate leaderboards (interactive prompts)
 python update_picks.py
+
+# Step 4 (Optional): Generate flat-table analysis
+python update_analyze.py
 ```
 Follow the prompts to select sport and time period.
 
@@ -131,7 +139,14 @@ Options:
 ```bash
 python update_picks.py
 ```
-Runs an interactive menu to choose sport and time window (latest week, previous week, last 5 weeks, full season).
+Runs an interactive menu to choose sport and time window (latest week, previous week, last 5 weeks, full season). Generates a leaderboard-style Excel with a pick-by-pick grid.
+
+#### update_analyze.py
+
+```bash
+python update_analyze.py
+```
+Runs an interactive menu to choose sport and time window. Generates a flat-table Excel analysis with one row per user per game, including entry prices, consensus percentages, and pick results.
 
 ### Example Workflows
 
@@ -199,9 +214,18 @@ The system implements intelligent rate limiting:
 | `db_trades_cbb.csv` | CBB trade records with P&L |
 
 ### Leaderboard Files (Excel)
+
 | File | Description |
 |------|-------------|
 | `leaderboard_{sport}_weeks_{N}-{M}.xlsx` | Performance leaderboard for specified weeks |
+| `leaderboard_{sport}_season_{year}.xlsx` | Full season leaderboard |
+
+### Analysis Files (Excel)
+
+| File | Description |
+|------|-------------|
+| `analysis_{sport}_weeks_{N}-{M}.xlsx` | Flat-table analysis for specified weeks |
+| `analysis_{sport}_season_{year}.xlsx` | Full season flat-table analysis |
 
 ### Excel Leaderboard Structure
 
@@ -227,6 +251,26 @@ The generated Excel file contains:
 | win_streak | Current winning streak |
 | last_10 | Correct in last 10 games |
 | [Game columns] | Pick for each game (team name) |
+
+### Excel Analysis Structure (Flat Table)
+
+The analysis Excel file (`update_analyze.py`) contains a flat table with one row per user per game:
+
+| Column | Description |
+|--------|-------------|
+| User | Wallet address (clickable link to Polymarket profile) |
+| Games | Total games predicted by user |
+| Wins | Correct predictions |
+| Losses | Incorrect predictions |
+| Win % | Accuracy percentage |
+| Streak | Current winning streak |
+| Last 10 | Correct in last 10 games |
+| Game | Match title (Team A vs Team B) |
+| Game Date | Date of the game |
+| Pick | Team the user picked |
+| Result | won/lost/pending |
+| Price | Entry price when pick was made |
+| Pick % | Percentage of users who made the same pick |
 
 ## Filtering Logic
 
@@ -261,13 +305,16 @@ polymarket-sports-analytics/
 ├── update_markets.py      # Gamma API market fetcher
 ├── update_trades.py       # GraphQL P&L calculator
 ├── update_picks.py        # Leaderboard generator
+├── update_analyze.py      # Flat-table analysis generator
 ├── requirements.txt       # Python dependencies
-├── README.md             # This file
-├── tests/                # Test suite
+├── README.md              # This file
+├── CLAUDE.md              # AI assistant guidance
+├── tests/                 # Test suite
+│   ├── __init__.py
 │   ├── test_markets.py
 │   ├── test_trades.py
 │   └── test_picks.py
-└── logs/                 # Runtime logs
+└── logs/                  # Runtime logs
     ├── markets.log
     ├── trades.log
     └── picks.log

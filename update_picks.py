@@ -1,170 +1,28 @@
 import os
 import time
 import pandas as pd
-from datetime import datetime, timedelta
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
-OUTPUT_DIR = "."
-
-# Sport-specific configurations for 2025-2026 seasons
-SPORTS_CONFIG = {
-    "NFL": {
-        "input_csv": "db_trades_nfl.csv",
-        "season_start": datetime(2025, 9, 3),   # 2025 season, Week 1 starts Thu Sep 4
-        "total_weeks": 18,
-        "season_year": 2025,
-    },
-    "NBA": {
-        "input_csv": "db_trades_nba.csv",
-        "season_start": datetime(2025, 10, 21), # 2025-26 season starts late Oct
-        "total_weeks": 26,                       # ~26 weeks regular season
-        "season_year": 2026,
-    },
-    "CFB": {
-        "input_csv": "db_trades_cfb.csv",
-        "season_start": datetime(2025, 8, 23),  # 2025 season, Week 0 late August
-        "total_weeks": 16,                       # Including bowl season
-        "season_year": 2025,
-    },
-    "CBB": {
-        "input_csv": "db_trades_cbb.csv",
-        "season_start": datetime(2025, 11, 3),  # 2025-26 season starts early Nov
-        "total_weeks": 22,                       # Through March Madness
-        "season_year": 2026,
-    },
-}
-
-# Cache of latest week found in CSVs to avoid repeated reads.
-_MAX_WEEK_CACHE = {}
-
-# Colors
-GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-YELLOW_FILL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-HEADER_FONT = Font(color="FFFFFF", bold=True)
-
-
-# =============================================================================
-# Schedule Functions
-# =============================================================================
-
-def get_csv_max_week(sport: str) -> int:
-    """
-    Get max week number implied by latest game_start_time in the CSV.
-    Returns 0 if the file is missing or has no valid dates.
-    """
-    if sport in _MAX_WEEK_CACHE:
-        return _MAX_WEEK_CACHE[sport]
-
-    config = SPORTS_CONFIG[sport]
-    input_csv = config["input_csv"]
-    season_start = config["season_start"]
-    max_week = 0
-
-    if os.path.exists(input_csv):
-        try:
-            dates_df = pd.read_csv(input_csv, usecols=["game_start_time"])
-            game_dates = pd.to_datetime(
-                dates_df["game_start_time"].astype(str).str[:10],
-                errors="coerce",
-            )
-            max_date = game_dates.max()
-            if pd.notna(max_date) and max_date >= season_start:
-                max_week = ((max_date - season_start).days // 7) + 1
-        except Exception:
-            max_week = 0
-
-    _MAX_WEEK_CACHE[sport] = max_week
-    return max_week
-
-
-def get_week_dates(week: int, sport: str) -> Tuple[str, str]:
-    """
-    Get start and end dates for a specific week.
-
-    Args:
-        week: Week number
-        sport: Sport key (NFL, NBA, CFB, CBB)
-
-    Returns:
-        Tuple of (start_date, end_date) in 'YYYY-MM-DD' format
-    """
-    config = SPORTS_CONFIG[sport]
-    total_weeks = config["total_weeks"]
-    season_start = config["season_start"]
-    max_weeks = max(total_weeks, get_csv_max_week(sport))
-
-    if week < 1 or week > max_weeks:
-        raise ValueError(f"Week must be between 1 and {max_weeks}, got {week}")
-
-    # Each week is 7 days
-    week_offset = (week - 1) * 7
-
-    start_date = season_start + timedelta(days=week_offset)
-    end_date = start_date + timedelta(days=7)
-
-    return (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-
-
-def get_current_week(sport: str) -> int:
-    """
-    Auto-detect the current week based on today's date.
-
-    Args:
-        sport: Sport key (NFL, NBA, CFB, CBB)
-
-    Returns:
-        Current week number, or 0 if before season
-    """
-    config = SPORTS_CONFIG[sport]
-    season_start = config["season_start"]
-    total_weeks = config["total_weeks"]
-    week_from_csv = get_csv_max_week(sport)
-
-    today = datetime.now()
-
-    # Before season starts
-    if today < season_start:
-        return 0
-
-    # Calculate days since season start
-    days_elapsed = (today - season_start).days
-    week_from_today = (days_elapsed // 7) + 1
-
-    # Use latest CSV week when available to avoid jumping ahead of data.
-    if week_from_csv > 0:
-        return min(week_from_today, week_from_csv)
-
-    # Fall back to configured season length if CSV data is unavailable.
-    return min(week_from_today, total_weeks)
-
-
-def get_last_n_weeks(n: int, sport: str) -> List[int]:
-    """
-    Get the last N weeks including the current week.
-
-    Args:
-        n: Number of weeks to return
-        sport: Sport key (NFL, NBA, CFB, CBB)
-
-    Returns:
-        List of week numbers from oldest to newest
-    """
-    current = get_current_week(sport)
-
-    if current == 0:
-        return []
-
-    start_week = max(1, current - n + 1)
-    return list(range(start_week, current + 1))
+# Import from shared modules
+from utils.shared_utils import (
+    SPORTS_CONFIG,
+    normalize_is_correct,
+    parse_game_teams,
+    filter_by_weeks,
+    get_output_filename,
+)
+from utils.excel_utils import (
+    GREEN_FILL,
+    RED_FILL,
+    YELLOW_FILL,
+    HEADER_FILL,
+    HEADER_FONT,
+    format_time,
+)
+from utils.menu_utils import select_sport, select_time_period
 
 
 # =============================================================================
@@ -184,6 +42,13 @@ def load_and_transform(input_csv: str) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
     print(f"   Loaded {len(df):,} rows")
 
+    # Validate required columns exist
+    required_cols = ['is_correct_pick', 'game_start_time', 'match_title',
+                     'user_pick', 'yes_avg_price', 'no_avg_price', 'user_address']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in CSV: {missing}")
+
     print("Transforming data...")
 
     # Extract game_date from game_start_time (just take first 10 chars: YYYY-MM-DD)
@@ -192,26 +57,7 @@ def load_and_transform(input_csv: str) -> pd.DataFrame:
     # Create unique game identifier (match_title + date) to handle rematches
     df['game'] = df['match_title'] + ' (' + df['game_date'] + ')'
 
-    # Map is_correct_pick to result
-    # Values can be booleans or "TRUE"/"FALSE" strings from CSV.
-    def normalize_is_correct(value):
-        if pd.isna(value):
-            return None
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            if value == 1:
-                return True
-            if value == 0:
-                return False
-        if isinstance(value, str):
-            normalized = value.strip().upper()
-            if normalized in ("TRUE", "1"):
-                return True
-            if normalized in ("FALSE", "0"):
-                return False
-        return None
-
+    # Map is_correct_pick to result using shared normalize function
     normalized_is_correct = df['is_correct_pick'].apply(normalize_is_correct)
     df['is_correct_pick'] = normalized_is_correct
     df['result'] = normalized_is_correct.map({True: 'won', False: 'lost'}).fillna('pending')
@@ -227,12 +73,13 @@ def load_and_transform(input_csv: str) -> pd.DataFrame:
     # Calculate user's entry price for their pick
     # If user_pick matches first team (Team A), use yes_avg_price, else no_avg_price
     def get_pick_price(row):
-        parts = row['game'].replace(" vs. ", " vs ").split(" vs ")
-        team_a = parts[0].strip() if len(parts) == 2 else ""
+        team_a, _ = parse_game_teams(row['game'])
         if row['user_pick'] == team_a:
-            return row.get('yes_avg_price', 0) or 0
+            price = row.get('yes_avg_price')
+            return price if price is not None and not pd.isna(price) else 0
         else:
-            return row.get('no_avg_price', 0) or 0
+            price = row.get('no_avg_price')
+            return price if price is not None and not pd.isna(price) else 0
 
     df['pick_price'] = df.apply(get_pick_price, axis=1)
 
@@ -266,73 +113,31 @@ def load_and_transform(input_csv: str) -> pd.DataFrame:
     print(f"   Excluded {excluded_users:,} users (< 70% win rate with 5+ games)")
     print(f"   Remaining: {df['user_address'].nunique():,} users")
 
+    # ==========================================================================
+    # Filter users by minimum games (>= 3 games)
+    # ==========================================================================
+    print("Filtering by minimum games...")
+    user_game_counts = df.groupby('user_address').size()
+    users_with_min_games = user_game_counts[user_game_counts >= 3].index
+    original_users = df['user_address'].nunique()
+    df = df[df['user_address'].isin(users_with_min_games)]
+    excluded_users = original_users - df['user_address'].nunique()
+    print(f"   Excluded {excluded_users:,} users (< 3 games)")
+    print(f"   Remaining: {df['user_address'].nunique():,} users")
+
+    # ==========================================================================
+    # Filter users by minimum wins (>= 3 wins)
+    # ==========================================================================
+    print("Filtering by minimum wins...")
+    user_wins = df[df['result'] == 'won'].groupby('user_address').size()
+    users_with_min_wins = user_wins[user_wins >= 3].index
+    original_users = df['user_address'].nunique()
+    df = df[df['user_address'].isin(users_with_min_wins)]
+    excluded_users = original_users - df['user_address'].nunique()
+    print(f"   Excluded {excluded_users:,} users (< 3 wins)")
+    print(f"   Remaining: {df['user_address'].nunique():,} users")
+
     return df
-
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
-def calculate_streak(results: list, streak_type: str) -> int:
-    """
-    Calculate current winning or losing streak.
-    Results should be ordered from most recent to oldest.
-    """
-    if not results:
-        return 0
-
-    streak = 0
-    target = "won" if streak_type == "win" else "lost"
-
-    for result in results:
-        if result == target:
-            streak += 1
-        elif result in ("won", "lost"):  # Stop at opposite result, skip pending
-            break
-
-    return streak
-
-
-def filter_by_weeks(df: pd.DataFrame, weeks: List[int], sport: str) -> pd.DataFrame:
-    """
-    Filter DataFrame to only include games from specified weeks.
-
-    Uses game_date to determine which week a game belongs to.
-    """
-    if not weeks or df.empty:
-        return df
-
-    # Build date ranges for all weeks
-    date_ranges = []
-    for week in weeks:
-        start, end = get_week_dates(week, sport)
-        date_ranges.append((start, end))
-
-    # Filter by date
-    mask = pd.Series([False] * len(df))
-
-    for start, end in date_ranges:
-        week_mask = (df["game_date"] >= start) & (df["game_date"] < end)
-        mask = mask | week_mask
-
-    filtered = df[mask]
-
-    return filtered
-
-
-def get_output_filename(weeks: Optional[List[int]], is_season: bool, sport: str) -> str:
-    """Generate output filename based on filter and sport."""
-    config = SPORTS_CONFIG[sport]
-    season_year = config["season_year"]
-    sport_lower = sport.lower()
-
-    if is_season or weeks is None:
-        return os.path.join(OUTPUT_DIR, f"leaderboard_{sport_lower}_season_{season_year}.xlsx")
-
-    if len(weeks) == 1:
-        return os.path.join(OUTPUT_DIR, f"leaderboard_{sport_lower}_week_{weeks[0]}.xlsx")
-
-    return os.path.join(OUTPUT_DIR, f"leaderboard_{sport_lower}_weeks_{min(weeks)}-{max(weeks)}.xlsx")
 
 
 # =============================================================================
@@ -379,7 +184,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     stats_df["win_pct"] = stats_df["win_pct"].fillna(0)
     stats_df = stats_df.drop(columns=["total_decided"])
 
-    print(f"   Stats computed in {time.time() - start_time:.1f}s")
+    print(f"   Stats computed in {format_time(time.time() - start_time)}")
 
     # ==========================================================================
     # OPTIMIZED: Vectorized streak calculation
@@ -425,7 +230,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     stats_df["win_streak"] = stats_df["win_streak"].fillna(0).astype(int)
     stats_df["loss_streak"] = stats_df["loss_streak"].fillna(0).astype(int)
 
-    print(f"   Streaks computed in {time.time() - streak_time:.1f}s")
+    print(f"   Streaks computed in {format_time(time.time() - streak_time)}")
 
     # ==========================================================================
     # Calculate Last 10 Games Win Rate (recent form across whole dataset)
@@ -458,7 +263,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
         stats_df['last_10_wins'] = 0
         stats_df['last_10_games'] = 0
 
-    print(f"   Last 10 computed in {time.time() - last10_time:.1f}s")
+    print(f"   Last 10 computed in {format_time(time.time() - last10_time)}")
 
     # ==========================================================================
     # OPTIMIZED: Vectorized pivot for picks
@@ -488,7 +293,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     # Combine pivots
     pivot_df = picks_pivot.join(results_pivot).reset_index()
 
-    print(f"   Pivot completed in {time.time() - pivot_time:.1f}s")
+    print(f"   Pivot completed in {format_time(time.time() - pivot_time)}")
 
     # ==========================================================================
     # Calculate consensus percentages per game (team names only, formulas will calculate %)
@@ -508,12 +313,9 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
             game_date = ""
             match_title = game_name
 
-        # Parse team names from match title (format: "Team A vs Team B" or "Team A vs. Team B")
-        parts = match_title.replace(" vs. ", " vs ").split(" vs ")
-        if len(parts) == 2:
-            team_a = parts[0].strip()
-            team_b = parts[1].strip()
-        else:
+        # Parse team names from match title
+        team_a, team_b = parse_game_teams(match_title)
+        if not team_a:
             team_a = "Team A"
             team_b = "Team B"
 
@@ -524,7 +326,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
             'game_date': game_date,
         }
 
-    print(f"   Consensus computed in {time.time() - consensus_time:.1f}s")
+    print(f"   Consensus computed in {format_time(time.time() - consensus_time)}")
 
     # ==========================================================================
     # Merge everything
@@ -546,8 +348,8 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     # Fill NaN with empty string for display
     result_df = result_df.fillna("")
 
-    print(f"   Merge completed in {time.time() - merge_time:.1f}s")
-    print(f"Created {len(result_df):,} user rows (total: {time.time() - start_time:.1f}s)")
+    print(f"   Merge completed in {format_time(time.time() - merge_time)}")
+    print(f"Created {len(result_df):,} user rows (total: {format_time(time.time() - start_time)})")
 
     # ==========================================================================
     # Write Excel (normal mode for freeze pane support)
@@ -709,7 +511,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
                     cell.fill = YELLOW_FILL
 
     print(f"   Writing row {total_rows:,}/{total_rows:,} (100.0%)")
-    print(f"   Excel rows written in {time.time() - excel_time:.1f}s")
+    print(f"   Excel rows written in {format_time(time.time() - excel_time)}")
 
     # Add freeze pane after last_10 column and header rows (column I, row 7)
     ws.freeze_panes = "I7"
@@ -718,7 +520,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     print("Saving file...")
     save_time = time.time()
     wb.save(output_file)
-    print(f"   File saved in {time.time() - save_time:.1f}s")
+    print(f"   File saved in {format_time(time.time() - save_time)}")
 
     # Print preview
     print("\n" + "="*80)
@@ -732,7 +534,7 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
 
     total_time = time.time() - start_time
     print(f"\nSaved: {output_file}")
-    print(f"Total time: {total_time:.1f}s")
+    print(f"Total time: {format_time(total_time)}")
 
 
 # =============================================================================
@@ -768,117 +570,20 @@ def do_generate(sport: str, weeks: Optional[List[int]] = None, is_season: bool =
         return
 
     # Generate output filename
-    output_file = get_output_filename(weeks, is_season, sport)
+    output_file = get_output_filename(weeks, is_season, sport, prefix="leaderboard")
 
     # Generate Excel
     generate_excel(df, output_file, title)
 
 
-def parse_week_range(range_str: str) -> List[int]:
-    """Parse week range string like '10-14' into list [10, 11, 12, 13, 14]."""
-    if "-" in range_str:
-        parts = range_str.split("-")
-        start = int(parts[0])
-        end = int(parts[1])
-        return list(range(start, end + 1))
-    else:
-        return [int(range_str)]
-
-
 # =============================================================================
-# Interactive Menu
+# Main Entry Point
 # =============================================================================
-
-def select_sport() -> Optional[str]:
-    """Display sport selection menu and return selected sport."""
-    print("=" * 50)
-    print("Leaderboard Generator")
-    print("=" * 50)
-    print()
-    print("Select sport:")
-    print("  1. NFL")
-    print("  2. NBA")
-    print("  3. CFB")
-    print("  4. CBB")
-    print("  0. Exit")
-    print()
-
-    choice = input("Enter choice (0-4): ").strip()
-
-    if choice == "0":
-        print("Exiting.")
-        return None
-
-    sport_map = {"1": "NFL", "2": "NBA", "3": "CFB", "4": "CBB"}
-    sport = sport_map.get(choice)
-
-    if not sport:
-        print("Invalid choice")
-        return None
-
-    # Check if input file exists
-    config = SPORTS_CONFIG[sport]
-    if not os.path.exists(config["input_csv"]):
-        print(f"\nWarning: {config['input_csv']} not found.")
-        print("Please run update_trades.py first to generate the data file.")
-        return None
-
-    return sport
-
-
-def select_time_period(sport: str) -> Tuple[Optional[List[int]], bool]:
-    """Display time period selection menu and return (weeks, is_season)."""
-    config = SPORTS_CONFIG[sport]
-    season_year = config["season_year"]
-
-    current = get_current_week(sport)
-    print()
-    print(f"{sport} {season_year} Season")
-    print(f"   Current Week: {current}")
-    print()
-
-    # Build menu options
-    last5 = get_last_n_weeks(5, sport)
-
-    print("Select time period:")
-    print(f"  1. Latest week (Week {current})")
-    if current > 1:
-        print(f"  2. Previous week (Week {current - 1})")
-    if last5:
-        print(f"  3. Last 5 weeks (Weeks {min(last5)}-{max(last5)})")
-    print(f"  4. Whole season")
-    print("  0. Exit")
-    print()
-
-    choice = input("Enter choice (0-4): ").strip()
-
-    if choice == "0":
-        print("Exiting.")
-        return None, False
-
-    if choice == "1":
-        weeks = [current]
-        print(f"\nGenerating {sport} Week {current} leaderboard...")
-    elif choice == "2" and current > 1:
-        weeks = [current - 1]
-        print(f"\nGenerating {sport} Week {current - 1} leaderboard...")
-    elif choice == "3" and last5:
-        weeks = last5
-        print(f"\nGenerating {sport} Weeks {min(last5)}-{max(last5)} leaderboard...")
-    elif choice == "4":
-        weeks = None
-        print(f"\nGenerating {sport} Full Season leaderboard...")
-    else:
-        print("Invalid choice")
-        return None, False
-
-    return weeks, (weeks is None)
-
 
 def main():
     # Step 1: Select sport
-    sport = select_sport()
-    if not sport:
+    sport = select_sport(title="Leaderboard Generator")
+    if not sport or sport == "exit":
         return
 
     # Step 2: Select time period

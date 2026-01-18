@@ -47,19 +47,19 @@ import logging
 def setup_logging():
     """Configure logging to both console and file."""
     os.makedirs("logs", exist_ok=True)
-    
-    log_logger = logging.getLogger(__name__)
-    log_logger.setLevel(logging.INFO)
-    
+
+    log = logging.getLogger(__name__)
+    log.setLevel(logging.INFO)
+
     # Prevent duplicate handlers on reimport
-    if not log_logger.handlers:
+    if not log.handlers:
         file_handler = logging.FileHandler("logs/markets.log", encoding='utf-8')
         file_handler.setLevel(logging.INFO)
         file_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_format)
-        log_logger.addHandler(file_handler)
-    
-    return log_logger
+        log.addHandler(file_handler)
+
+    return log
 
 logger = setup_logging()
 
@@ -313,7 +313,14 @@ def fetch_sports():
     except requests.exceptions.RequestException as e:
         print(f"Error fetching sports data: {e}")
         return []
-    
+
+    # Handle case where API returns dict with nested data (like fetch_events_for_series)
+    if isinstance(sports_data, dict) and 'data' in sports_data:
+        sports_data = sports_data['data']
+    if not isinstance(sports_data, list):
+        print(f"Warning: Unexpected sports response format (expected list)")
+        return []
+
     matched_sports = []
     for sport in sports_data:
         series_id = sport.get('series')
@@ -562,7 +569,11 @@ def main():
         return
     
     df = pd.DataFrame(all_markets)
-    df['game_start_time'] = pd.to_datetime(df['game_start_time'])
+    try:
+        df['game_start_time'] = pd.to_datetime(df['game_start_time'])
+    except Exception as e:
+        logger.warning(f"Some game_start_time values could not be parsed: {e}")
+        df['game_start_time'] = pd.to_datetime(df['game_start_time'], errors='coerce')
     df = df.sort_values('game_start_time', ascending=False)
 
     # Deduplicate by condition_id (keep first = most recent due to sort above)

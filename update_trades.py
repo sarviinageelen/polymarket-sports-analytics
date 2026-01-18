@@ -51,9 +51,7 @@ Caching:
 import argparse
 import requests
 from typing import Dict, Optional, List
-import json
 import csv
-from datetime import datetime
 import os
 import time
 import logging
@@ -306,63 +304,6 @@ def get_condition(condition_id: str, use_cache: bool = True) -> Optional[Dict]:
     return result
 
 
-def get_user_positions(user_address: str, position_ids: List[str]) -> Dict[str, Dict]:
-    """
-    Fetch a single user's positions for specified token IDs.
-    
-    Queries the PNL subgraph for UserPosition entities, which track
-    a user's holdings, average entry price, and realized PNL.
-    
-    Args:
-        user_address: User's Ethereum wallet address (any case)
-        position_ids: List of token IDs to query (typically [YES_id, NO_id])
-    
-    Returns:
-        Dict mapping token_id -> position data. Each position contains:
-        - id: UserPosition ID ('{address}-{tokenId}')
-        - user: User address
-        - tokenId: Token ID
-        - amount: Current holdings (in base units, divide by COLLATERAL_SCALE)
-        - avgPrice: Average entry price (scaled, divide by COLLATERAL_SCALE)
-        - realizedPnl: Realized profit/loss (scaled)
-        - totalBought: Historical total purchased (scaled)
-        
-        Missing positions are not included in the returned dict.
-    
-    Note:
-        For batch operations, use get_batch_user_positions() instead.
-    """
-    # Create UserPosition IDs: {userAddress}-{tokenId}
-    user_position_ids = [
-        f"{user_address.lower()}-{token_id}"
-        for token_id in position_ids
-    ]
-
-    query = """
-    query GetUserPositions($ids: [ID!]!) {
-        userPositions(where: { id_in: $ids }) {
-            id
-            user
-            tokenId
-            amount
-            avgPrice
-            realizedPnl
-            totalBought
-        }
-    }
-    """
-
-    variables = {"ids": user_position_ids}
-    data = query_subgraph(PNL_SUBGRAPH_URL, query, variables)
-
-    # Map by tokenId for easier access
-    positions = {}
-    for position in data.get("userPositions", []):
-        positions[position["tokenId"]] = position
-
-    return positions
-
-
 def _fetch_single_price(token_id: str) -> tuple:
     """
     Fetch current market price for a single token from orderbook.
@@ -563,11 +504,11 @@ def determine_user_pick(yes_position, no_position, match_title):
     """
     yes_bought = float(yes_position["totalBought"]) if yes_position else 0.0
     no_bought = float(no_position["totalBought"]) if no_position else 0.0
-    
-    # No position or equal amounts (rare edge case)
+
+    # No positions at all
     if yes_bought == 0 and no_bought == 0:
         return "NONE"
-    
+
     # Parse team names from match_title (format: "Team A vs Team B" or "Team A vs. Team B")
     team_a = ""
     team_b = ""
@@ -576,9 +517,10 @@ def determine_user_pick(yes_position, no_position, match_title):
         if len(parts) == 2:
             team_a = parts[0].strip()
             team_b = parts[1].strip()
-    
+
     # Determine which side they bet
-    if yes_bought > no_bought:
+    # Equal bets on both sides: default to YES (Team A) as tiebreaker
+    if yes_bought >= no_bought:
         return team_a if team_a else "YES"
     else:
         return team_b if team_b else "NO"
@@ -652,17 +594,17 @@ def build_csv_row(
         "user_address": user_address,
         "user_pick": user_pick,
         "is_correct_pick": is_correct,
-        "yes_current_holdings": format_number(float(yes_pos["amount"]) / COLLATERAL_SCALE if yes_pos else 0.0),
-        "yes_avg_price": format_number(float(yes_pos["avgPrice"]) / COLLATERAL_SCALE if yes_pos else 0.0),
-        "yes_total_bought": format_number(float(yes_pos["totalBought"]) / COLLATERAL_SCALE if yes_pos else 0.0),
-        "yes_current_price": format_number(results["YES"]["current_price"] / COLLATERAL_SCALE if results["YES"]["current_price"] else None),
+        "yes_current_holdings": format_number(float(yes_pos["amount"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
+        "yes_avg_price": format_number(float(yes_pos["avgPrice"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
+        "yes_total_bought": format_number(float(yes_pos["totalBought"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
+        "yes_current_price": format_number(results["YES"]["current_price"] / COLLATERAL_SCALE if results["YES"]["current_price"] is not None else None),
         "yes_realized_pnl": format_number(results["YES"]["realized_pnl"] / COLLATERAL_SCALE),
         "yes_unrealized_pnl": format_number(results["YES"]["unrealized_pnl"] / COLLATERAL_SCALE),
         "yes_total_pnl": format_number(results["YES"]["total_pnl"] / COLLATERAL_SCALE),
-        "no_current_holdings": format_number(float(no_pos["amount"]) / COLLATERAL_SCALE if no_pos else 0.0),
-        "no_avg_price": format_number(float(no_pos["avgPrice"]) / COLLATERAL_SCALE if no_pos else 0.0),
-        "no_total_bought": format_number(float(no_pos["totalBought"]) / COLLATERAL_SCALE if no_pos else 0.0),
-        "no_current_price": format_number(results["NO"]["current_price"] / COLLATERAL_SCALE if results["NO"]["current_price"] else None),
+        "no_current_holdings": format_number(float(no_pos["amount"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
+        "no_avg_price": format_number(float(no_pos["avgPrice"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
+        "no_total_bought": format_number(float(no_pos["totalBought"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
+        "no_current_price": format_number(results["NO"]["current_price"] / COLLATERAL_SCALE if results["NO"]["current_price"] is not None else None),
         "no_realized_pnl": format_number(results["NO"]["realized_pnl"] / COLLATERAL_SCALE),
         "no_unrealized_pnl": format_number(results["NO"]["unrealized_pnl"] / COLLATERAL_SCALE),
         "no_total_pnl": format_number(results["NO"]["total_pnl"] / COLLATERAL_SCALE),
@@ -734,203 +676,6 @@ def write_to_csv(
     
     if verbose:
         print(f"\nResults appended to {csv_file}")
-
-
-def calculate_market_pnl(
-    condition_id: str,
-    user_address: str,
-    verbose: bool = True,
-    output_csv: Optional[str] = None,
-    market_metadata: Optional[Dict] = None
-):
-    """
-    Calculate complete PNL breakdown for a single user in a market.
-    
-    Performs the full PNL calculation pipeline:
-    1. Fetch condition data (token IDs for YES/NO outcomes)
-    2. Fetch user's positions for both outcomes
-    3. Fetch current market prices from orderbook
-    4. Calculate realized + unrealized PNL for each outcome
-    
-    Args:
-        condition_id: Market's condition ID from Polymarket
-        user_address: User's Ethereum wallet address
-        verbose: If True, prints detailed position and PNL info
-        output_csv: Optional file path to write results
-        market_metadata: Optional dict with sport, match_title, etc.
-    
-    Returns:
-        Dict with structure:
-        {
-            "YES": {position, current_price, realized_pnl, unrealized_pnl, total_pnl},
-            "NO": {position, current_price, realized_pnl, unrealized_pnl, total_pnl}
-        }
-    
-    Raises:
-        ValueError: If condition not found or has <2 position IDs
-    """
-    # Step 1: Get condition data
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"Querying Condition: {condition_id}")
-        print(f"{'='*60}\n")
-
-    condition = get_condition(condition_id)
-
-    if not condition:
-        raise ValueError(f"Condition {condition_id} not found in subgraph")
-
-    position_ids = condition.get("positionIds", [])
-    if len(position_ids) < 2:
-        raise ValueError(f"Condition {condition_id} has less than 2 position IDs (got {len(position_ids)})")
-    
-    yes_token_id = position_ids[0]
-    no_token_id = position_ids[1]
-
-    if verbose:
-        print(f"YES Token ID: {yes_token_id}")
-        print(f"NO Token ID:  {no_token_id}")
-        print()
-
-    # Step 2: Get user positions
-    if verbose:
-        print(f"Querying UserPositions for: {user_address}")
-        print()
-
-    user_positions = get_user_positions(user_address, position_ids)
-
-    yes_position = user_positions.get(yes_token_id)
-    no_position = user_positions.get(no_token_id)
-
-    # Step 3: Get current prices
-    if verbose:
-        print("Fetching current market prices...")
-        print()
-
-    current_prices = get_current_prices(position_ids)
-
-    # Step 4: Calculate PNL for each outcome
-    results = {
-        "YES": {
-            "position": yes_position,
-            "current_price": current_prices.get(yes_token_id),
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "total_pnl": 0.0
-        },
-        "NO": {
-            "position": no_position,
-            "current_price": current_prices.get(no_token_id),
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "total_pnl": 0.0
-        }
-    }
-
-    # Calculate YES PNL
-    if yes_position:
-        amount = float(yes_position["amount"])
-        avg_price = float(yes_position["avgPrice"])
-        realized_pnl = float(yes_position["realizedPnl"])
-
-        results["YES"]["realized_pnl"] = realized_pnl
-
-        if current_prices.get(yes_token_id):
-            current_price = current_prices[yes_token_id]
-            unrealized_pnl = calculate_unrealized_pnl(amount, avg_price, current_price)
-            results["YES"]["unrealized_pnl"] = unrealized_pnl
-            results["YES"]["total_pnl"] = realized_pnl + unrealized_pnl
-        else:
-            results["YES"]["total_pnl"] = realized_pnl
-
-    # Calculate NO PNL
-    if no_position:
-        amount = float(no_position["amount"])
-        avg_price = float(no_position["avgPrice"])
-        realized_pnl = float(no_position["realizedPnl"])
-
-        results["NO"]["realized_pnl"] = realized_pnl
-
-        if current_prices.get(no_token_id):
-            current_price = current_prices[no_token_id]
-            unrealized_pnl = calculate_unrealized_pnl(amount, avg_price, current_price)
-            results["NO"]["unrealized_pnl"] = unrealized_pnl
-            results["NO"]["total_pnl"] = realized_pnl + unrealized_pnl
-        else:
-            results["NO"]["total_pnl"] = realized_pnl
-
-    # Step 5: Print detailed results
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"PNL BREAKDOWN")
-        print(f"{'='*60}\n")
-
-        # YES Position
-        print("YES OUTCOME:")
-        if yes_position:
-            amount = float(yes_position["amount"])
-            avg_price = float(yes_position["avgPrice"])
-            total_bought = float(yes_position["totalBought"])
-
-            print(f"  Current Holdings: {format_usdc(amount)}")
-            print(f"  Average Entry Price: {format_price(avg_price)}")
-            print(f"  Total Bought (Historical): {format_usdc(total_bought)}")
-
-            if results["YES"]["current_price"]:
-                print(f"  Current Market Price: {format_price(results['YES']['current_price'])}")
-            else:
-                print(f"  Current Market Price: N/A")
-
-            print(f"  Realized PNL: {format_usdc(results['YES']['realized_pnl'])}")
-            print(f"  Unrealized PNL: {format_usdc(results['YES']['unrealized_pnl'])}")
-            print(f"  Total PNL: {format_usdc(results['YES']['total_pnl'])}")
-        else:
-            print("  No position found")
-
-        print()
-
-        # NO Position
-        print("NO OUTCOME:")
-        if no_position:
-            amount = float(no_position["amount"])
-            avg_price = float(no_position["avgPrice"])
-            total_bought = float(no_position["totalBought"])
-
-            print(f"  Current Holdings: {format_usdc(amount)}")
-            print(f"  Average Entry Price: {format_price(avg_price)}")
-            print(f"  Total Bought (Historical): {format_usdc(total_bought)}")
-
-            if results["NO"]["current_price"]:
-                print(f"  Current Market Price: {format_price(results['NO']['current_price'])}")
-            else:
-                print(f"  Current Market Price: N/A")
-
-            print(f"  Realized PNL: {format_usdc(results['NO']['realized_pnl'])}")
-            print(f"  Unrealized PNL: {format_usdc(results['NO']['unrealized_pnl'])}")
-            print(f"  Total PNL: {format_usdc(results['NO']['total_pnl'])}")
-        else:
-            print("  No position found")
-
-        print()
-
-        # Total Market PNL
-        total_realized = results["YES"]["realized_pnl"] + results["NO"]["realized_pnl"]
-        total_unrealized = results["YES"]["unrealized_pnl"] + results["NO"]["unrealized_pnl"]
-        total_pnl = results["YES"]["total_pnl"] + results["NO"]["total_pnl"]
-
-        print(f"{'='*60}")
-        print(f"TOTAL MARKET PNL")
-        print(f"{'='*60}")
-        print(f"  Total Realized PNL: {format_usdc(total_realized)}")
-        print(f"  Total Unrealized PNL: {format_usdc(total_unrealized)}")
-        print(f"  TOTAL PNL: {format_usdc(total_pnl)}")
-        print(f"{'='*60}\n")
-
-    # Write to CSV if requested
-    if output_csv:
-        write_to_csv(condition_id, user_address, results, output_csv, verbose=verbose, market_metadata=market_metadata)
-
-    return results
 
 
 def get_all_users_for_market(condition_id: str) -> List[str]:
@@ -1052,10 +797,10 @@ def get_batch_user_positions(user_addresses: List[str], position_ids: List[str])
     variables = {"ids": user_position_ids}
     data = query_subgraph(PNL_SUBGRAPH_URL, query, variables)
 
-    # Organize by user address
+    # Organize by user address (normalize to lowercase for consistent matching)
     user_data = {}
     for position in data.get("userPositions", []):
-        user = position["user"]
+        user = position["user"].lower()  # Normalize to lowercase
         token_id = position["tokenId"]
 
         if user not in user_data:
@@ -1275,27 +1020,34 @@ def calculate_pnl_for_all_users(
 
 def get_processed_markets(output_csv: str) -> dict:
     """
-    Get dict of condition_ids already processed with their resolution status.
+    Get dict of condition_ids already processed with their resolution status and outcome.
 
     Used for incremental processing - allows resuming from where
     we left off without reprocessing existing markets. Also tracks
-    resolution status so markets can be re-processed when they become resolved.
+    resolution status and winning_outcome so markets can be re-processed
+    when they become resolved or when the winner changes.
 
     Args:
         output_csv: Path to the output CSV file (db_trades.csv)
 
     Returns:
-        Dict mapping condition_id -> is_resolved (bool) from the output file.
+        Dict mapping condition_id -> {'is_resolved': bool, 'winning_outcome': str}.
         Returns empty dict if file doesn't exist or is unreadable.
     """
     if not os.path.isfile(output_csv):
         return {}
 
     try:
-        df = pd.read_csv(output_csv, usecols=['condition_id', 'is_resolved'])
+        df = pd.read_csv(output_csv, usecols=['condition_id', 'is_resolved', 'winning_outcome'])
         # Get unique condition_id with their resolution status (take first occurrence)
         unique_markets = df.drop_duplicates(subset=['condition_id'])
-        return dict(zip(unique_markets['condition_id'], unique_markets['is_resolved']))
+        result = {}
+        for _, row in unique_markets.iterrows():
+            result[row['condition_id']] = {
+                'is_resolved': row['is_resolved'],
+                'winning_outcome': str(row['winning_outcome']) if pd.notna(row['winning_outcome']) else ''
+            }
+        return result
     except Exception as e:
         print(f"Warning: Could not read existing output file: {e}")
         return {}
@@ -1389,28 +1141,41 @@ def process_all_markets(
     # Find markets that need re-processing:
     # 1. Markets that were unresolved before but are now resolved
     # 2. ALL unresolved markets (to capture new users who placed bets since last run)
+    # 3. Markets where winning_outcome has changed (rare but possible)
     markets_to_reprocess = []
     for _, market in filtered_markets.iterrows():
         cid = market['condition_id']
         if cid in processed_markets:
-            was_resolved = processed_markets[cid]
+            prev_data = processed_markets[cid]
+            was_resolved = prev_data['is_resolved']
+            prev_winner = prev_data['winning_outcome']
             is_now_resolved = market['is_resolved']
+            current_winner = str(market['winning_outcome']) if pd.notna(market['winning_outcome']) else ''
+
             # Re-process if it was unresolved before but is resolved now
             if not was_resolved and is_now_resolved:
                 markets_to_reprocess.append(cid)
             # Also re-process if it's STILL unresolved (to capture new bets)
             elif not is_now_resolved:
                 markets_to_reprocess.append(cid)
+            # Re-process if winning_outcome changed (rare edge case)
+            elif is_now_resolved and prev_winner != current_winner:
+                markets_to_reprocess.append(cid)
 
     # Remove old rows for markets that need re-processing
     if markets_to_reprocess and os.path.isfile(output_csv):
         print(f"Re-processing {len(markets_to_reprocess)} markets (unresolved + newly resolved)...")
-        df_existing = pd.read_csv(output_csv)
-        df_existing = df_existing[~df_existing['condition_id'].isin(markets_to_reprocess)]
-        df_existing.to_csv(output_csv, index=False)
-        # Update processed_markets to exclude re-processing markets
-        for cid in markets_to_reprocess:
-            del processed_markets[cid]
+        try:
+            df_existing = pd.read_csv(output_csv)
+            df_existing = df_existing[~df_existing['condition_id'].isin(markets_to_reprocess)]
+            df_existing.to_csv(output_csv, index=False)
+            # Update processed_markets to exclude re-processing markets
+            for cid in markets_to_reprocess:
+                del processed_markets[cid]
+        except Exception as e:
+            logger.error(f"Failed to update CSV for re-processing: {e}")
+            print(f"Error: Could not update {output_csv}: {e}")
+            return
 
     # Filter out already processed markets (excluding those marked for re-processing)
     markets_to_process = filtered_markets[
@@ -1448,7 +1213,7 @@ def process_all_markets(
 
             # OVERALL PROGRESS
             overall_bar = progress_bar(idx, total_to_process, width=30)
-            eta = calculate_eta(elapsed, idx - 1, total_to_process) if idx > 1 else "..."
+            eta = calculate_eta(elapsed, idx, total_to_process)
 
             print(f"\n{overall_bar} | ETA: {eta}")
             print(f"  {market['outcome_team_a']} vs {market['outcome_team_b']}")

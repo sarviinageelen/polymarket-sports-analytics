@@ -4,79 +4,124 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-import numpy as np
+import pytest
+from datetime import datetime
 
-from update_picks import (
-    safe_divide,
-    fmt,
-    load_and_transform,
-    calculate_streaks,
-    calculate_time_window_stats,
-    calculate_bet_price_stats,
-    CFG,
-    HISTORICAL_COLUMNS,
-    ACTIVE_COLUMNS
+from update_picks import load_and_transform
+from utils.shared_utils import (
+    parse_game_teams,
+    get_week_dates,
+    get_output_filename,
+    filter_by_weeks,
+    SPORTS_CONFIG,
 )
 
 
-class TestConfig:
-    """Test configuration values are set correctly."""
-    
-    def test_output_files_historical(self):
-        assert CFG.OUTPUT_HISTORICAL_NFL == "output_picks_historical_nfl.csv"
-        assert CFG.OUTPUT_HISTORICAL_NBA == "output_picks_historical_nba.csv"
-        assert CFG.OUTPUT_HISTORICAL_CFB == "output_picks_historical_cfb.csv"
-        assert CFG.OUTPUT_HISTORICAL_CBB == "output_picks_historical_cbb.csv"
+class TestParseGameTeams:
+    """Test parse_game_teams helper function."""
 
-    def test_output_files_active(self):
-        assert CFG.OUTPUT_ACTIVE_NFL == "output_picks_active_nfl.csv"
-        assert CFG.OUTPUT_ACTIVE_NBA == "output_picks_active_nba.csv"
-        assert CFG.OUTPUT_ACTIVE_CFB == "output_picks_active_cfb.csv"
-        assert CFG.OUTPUT_ACTIVE_CBB == "output_picks_active_cbb.csv"
-    
-    def test_filtering_thresholds(self):
-        assert CFG.MIN_GAMES == 3
-        assert CFG.MIN_PNL == 1000.0
-        assert CFG.MIN_WIN_RATIO_FOR_ACTIVE == 66.67  # 0-100 scale
-    
-    def test_api_settings(self):
-        assert CFG.API_TIMEOUT == 10
-        assert CFG.API_MAX_WORKERS == 5
-        assert CFG.API_BATCH_SIZE == 100
+    def test_normal_vs(self):
+        team_a, team_b = parse_game_teams("Kansas City Chiefs vs Buffalo Bills")
+        assert team_a == "Kansas City Chiefs"
+        assert team_b == "Buffalo Bills"
+
+    def test_vs_with_period(self):
+        team_a, team_b = parse_game_teams("Chiefs vs. Raiders")
+        assert team_a == "Chiefs"
+        assert team_b == "Raiders"
+
+    def test_empty_string(self):
+        team_a, team_b = parse_game_teams("")
+        assert team_a == ""
+        assert team_b == ""
+
+    def test_none_value(self):
+        team_a, team_b = parse_game_teams(None)
+        assert team_a == ""
+        assert team_b == ""
+
+    def test_no_vs(self):
+        team_a, team_b = parse_game_teams("No versus here")
+        assert team_a == ""
+        assert team_b == ""
+
+    def test_multiple_vs(self):
+        # Should split on first "vs" only
+        team_a, team_b = parse_game_teams("A vs B vs C")
+        # This should return empty since split results in 3 parts
+        assert team_a == ""
+        assert team_b == ""
 
 
-class TestColumnDefinitions:
-    """Test column lists are properly defined."""
-    
-    def test_historical_columns_exist(self):
-        required = ['user_address', 'games', 'wins', 'loss', 'win_ratio', 'profit']
-        for col in required:
-            assert col in HISTORICAL_COLUMNS, f"Missing column: {col}"
-    
-    def test_active_columns_exist(self):
-        required = ['user_address', 'condition_id', 'match_title', 'position', 'size']
-        for col in required:
-            assert col in ACTIVE_COLUMNS, f"Missing column: {col}"
+class TestGetWeekDates:
+    """Test get_week_dates function."""
+
+    def test_nfl_week_1(self):
+        start, end = get_week_dates(1, "NFL")
+        # NFL 2025 season starts Sep 3, Week 1 is Sep 3-10
+        assert start == "2025-09-03"
+        assert end == "2025-09-10"
+
+    def test_nfl_week_2(self):
+        start, end = get_week_dates(2, "NFL")
+        # Week 2 is Sep 10-17
+        assert start == "2025-09-10"
+        assert end == "2025-09-17"
+
+    def test_invalid_week_zero(self):
+        with pytest.raises(ValueError):
+            get_week_dates(0, "NFL")
+
+    def test_invalid_week_negative(self):
+        with pytest.raises(ValueError):
+            get_week_dates(-1, "NFL")
+
+
+class TestGetOutputFilename:
+    """Test get_output_filename function."""
+
+    def test_single_week(self):
+        filename = get_output_filename([5], False, "NFL")
+        assert filename.endswith("leaderboard_nfl_week_5.xlsx")
+
+    def test_multiple_weeks(self):
+        filename = get_output_filename([3, 4, 5], False, "NFL")
+        assert filename.endswith("leaderboard_nfl_weeks_3-5.xlsx")
+
+    def test_full_season(self):
+        filename = get_output_filename(None, True, "NFL")
+        assert filename.endswith("leaderboard_nfl_season_2025.xlsx")
+
+    def test_nba_season(self):
+        filename = get_output_filename(None, True, "NBA")
+        assert filename.endswith("leaderboard_nba_season_2026.xlsx")
 
 
 class TestLoadAndTransform:
+    """Test load_and_transform function."""
+
     def test_string_is_correct_pick_values(self, tmp_path):
+        # User needs >= 3 games and >= 3 wins to pass the filters
         df = pd.DataFrame({
             "game_start_time": [
                 "2025-09-10 12:00:00",
-                "2025-09-10 12:00:00",
-                "2025-09-10 12:00:00",
+                "2025-09-10 13:00:00",
+                "2025-09-10 14:00:00",
+                "2025-09-10 15:00:00",
+                "2025-09-10 16:00:00",
             ],
             "match_title": [
                 "Chiefs vs Raiders",
-                "Chiefs vs Raiders",
-                "Chiefs vs Raiders",
+                "Bills vs Dolphins",
+                "Cowboys vs Eagles",
+                "Packers vs Bears",
+                "49ers vs Seahawks",
             ],
-            "is_correct_pick": ["TRUE", "FALSE", ""],
-            "user_pick": ["Chiefs", "Raiders", "Chiefs"],
-            "yes_avg_price": [0.5, 0.5, 0.5],
-            "no_avg_price": [0.4, 0.4, 0.4],
-            "user_address": ["0x1", "0x1", "0x1"],
+            "is_correct_pick": ["TRUE", "TRUE", "TRUE", "FALSE", ""],
+            "user_pick": ["Chiefs", "Bills", "Cowboys", "Bears", "49ers"],
+            "yes_avg_price": [0.5, 0.5, 0.5, 0.4, 0.5],
+            "no_avg_price": [0.4, 0.4, 0.4, 0.5, 0.4],
+            "user_address": ["0x1", "0x1", "0x1", "0x1", "0x1"],
         })
 
         csv_path = tmp_path / "trades.csv"
@@ -84,120 +129,137 @@ class TestLoadAndTransform:
 
         result = load_and_transform(str(csv_path))
 
-        assert result["result"].tolist() == ["won", "lost", "pending"]
+        # User has 3 wins, 1 loss, 1 pending (5 games total, 3 wins = passes filters)
+        assert result["result"].tolist() == ["won", "won", "won", "lost", "pending"]
 
-
-class TestSafeDivide:
-    def test_normal_division(self):
-        assert safe_divide(10, 2) == 5.0
-    
-    def test_divide_by_zero(self):
-        assert safe_divide(10, 0) == 0.0
-    
-    def test_divide_by_zero_custom_default(self):
-        assert safe_divide(10, 0, default=-1) == -1
-    
-    def test_divide_by_nan(self):
-        assert safe_divide(10, float('nan')) == 0.0
-
-
-class TestFmt:
-    def test_format_float(self):
-        assert fmt(3.14159, 2) == 3.14
-    
-    def test_format_nan(self):
-        assert fmt(float('nan')) == 0.0
-    
-    def test_format_inf(self):
-        assert fmt(float('inf')) == 0.0
-
-
-class TestCalculateStreaks:
-    def test_all_wins(self):
-        trades = pd.DataFrame({'is_correct_pick': [1, 1, 1, 1, 1]})
-        result = calculate_streaks(trades)
-        assert result['current_streak'] == 5
-        assert result['max_win_streak'] == 5
-        assert result['max_loss_streak'] == 0
-    
-    def test_all_losses(self):
-        trades = pd.DataFrame({'is_correct_pick': [0, 0, 0]})
-        result = calculate_streaks(trades)
-        assert result['current_streak'] == -3
-        assert result['max_win_streak'] == 0
-        assert result['max_loss_streak'] == 3
-    
-    def test_mixed_results(self):
-        # W, W, L, W, W, W
-        trades = pd.DataFrame({'is_correct_pick': [1, 1, 0, 1, 1, 1]})
-        result = calculate_streaks(trades)
-        assert result['current_streak'] == 3
-        assert result['max_win_streak'] == 3
-        assert result['max_loss_streak'] == 1
-    
-    def test_empty_trades(self):
-        trades = pd.DataFrame({'is_correct_pick': []})
-        result = calculate_streaks(trades)
-        assert result['current_streak'] == 0
-        assert result['max_win_streak'] == 0
-        assert result['max_loss_streak'] == 0
-
-
-class TestCalculateTimeWindowStats:
-    def test_basic_stats(self):
-        trades = pd.DataFrame({
-            'is_correct_pick': [1, 1, 0, 1],
-            'total_pnl': [100, 200, -50, 150]
+    def test_boolean_is_correct_pick_values(self, tmp_path):
+        # User needs >= 3 games and >= 3 wins to pass the filters
+        df = pd.DataFrame({
+            "game_start_time": [
+                "2025-09-10 12:00:00",
+                "2025-09-10 13:00:00",
+                "2025-09-10 14:00:00",
+                "2025-09-10 15:00:00",
+            ],
+            "match_title": [
+                "Chiefs vs Raiders",
+                "Bills vs Dolphins",
+                "Cowboys vs Eagles",
+                "Packers vs Bears",
+            ],
+            "is_correct_pick": [True, True, True, False],
+            "user_pick": ["Chiefs", "Bills", "Cowboys", "Bears"],
+            "yes_avg_price": [0.5, 0.5, 0.5, 0.4],
+            "no_avg_price": [0.4, 0.4, 0.4, 0.5],
+            "user_address": ["0x1", "0x1", "0x1", "0x1"],
         })
-        result = calculate_time_window_stats(trades)
-        
-        assert result['games'] == 4
-        assert result['wins'] == 3
-        assert result['loss'] == 1
-        assert result['win_ratio'] == 75.0
-        assert result['profit'] == 400.0
-    
-    def test_empty_trades(self):
-        trades = pd.DataFrame({
-            'is_correct_pick': [],
-            'total_pnl': []
+
+        csv_path = tmp_path / "trades.csv"
+        df.to_csv(csv_path, index=False)
+
+        result = load_and_transform(str(csv_path))
+
+        # User has 3 wins, 1 loss (4 games total, 3 wins = passes filters)
+        assert result["result"].tolist() == ["won", "won", "won", "lost"]
+
+    def test_missing_columns_raises_error(self, tmp_path):
+        df = pd.DataFrame({
+            "game_start_time": ["2025-09-10 12:00:00"],
+            "match_title": ["Chiefs vs Raiders"],
+            # Missing other required columns
         })
-        result = calculate_time_window_stats(trades)
-        
-        assert result['games'] == 0
-        assert result['wins'] == 0
-        assert result['loss'] == 0
-        assert result['win_ratio'] == 0
-        assert result['profit'] == 0
+
+        csv_path = tmp_path / "trades.csv"
+        df.to_csv(csv_path, index=False)
+
+        with pytest.raises(ValueError, match="Missing required columns"):
+            load_and_transform(str(csv_path))
+
+    def test_late_picks_filtered(self, tmp_path):
+        # User 0x1 has 4 games with 3 wins (passes filters)
+        # User 0x2 has 1 late pick that gets filtered
+        df = pd.DataFrame({
+            "game_start_time": [
+                "2025-09-10 12:00:00",
+                "2025-09-10 13:00:00",
+                "2025-09-10 14:00:00",
+                "2025-09-10 15:00:00",
+                "2025-09-10 16:00:00",  # Late pick for user 0x2
+            ],
+            "match_title": [
+                "Chiefs vs Raiders",
+                "Bills vs Dolphins",
+                "Cowboys vs Eagles",
+                "Packers vs Bears",
+                "49ers vs Seahawks",
+            ],
+            "is_correct_pick": ["TRUE", "TRUE", "TRUE", "FALSE", "TRUE"],
+            "user_pick": ["Chiefs", "Bills", "Cowboys", "Bears", "49ers"],
+            "yes_avg_price": [0.5, 0.5, 0.5, 0.4, 0.96],  # Last pick is late (>= 0.95)
+            "no_avg_price": [0.4, 0.4, 0.4, 0.5, 0.04],
+            "user_address": ["0x1", "0x1", "0x1", "0x1", "0x2"],
+        })
+
+        csv_path = tmp_path / "trades.csv"
+        df.to_csv(csv_path, index=False)
+
+        result = load_and_transform(str(csv_path))
+
+        # User 0x1 has 4 picks remaining (3 wins, 1 loss = passes filters)
+        # User 0x2's late pick was filtered, then user 0x2 was filtered (< 3 games)
+        assert len(result) == 4
+        assert all(result["user_address"] == "0x1")
 
 
-class TestCalculateBetPriceStats:
-    def test_normal_prices(self):
-        trades = pd.DataFrame({'avg_price': [0.3, 0.4, 0.5, 0.6]})
-        result = calculate_bet_price_stats(trades)
-        assert result['avg_bet_price'] == 0.45
-        assert result['median_bet_price'] == 0.45
-    
-    def test_underdog_bettor(self):
-        # Low prices = betting on underdogs
-        trades = pd.DataFrame({'avg_price': [0.2, 0.25, 0.3, 0.35]})
-        result = calculate_bet_price_stats(trades)
-        assert result['avg_bet_price'] < 0.4
-    
-    def test_favorite_bettor(self):
-        # High prices = betting on favorites
-        trades = pd.DataFrame({'avg_price': [0.65, 0.7, 0.75, 0.8]})
-        result = calculate_bet_price_stats(trades)
-        assert result['avg_bet_price'] > 0.6
-    
-    def test_empty_trades(self):
-        trades = pd.DataFrame({'avg_price': []})
-        result = calculate_bet_price_stats(trades)
-        assert result['avg_bet_price'] == 0.5
-        assert result['median_bet_price'] == 0.5
-    
-    def test_missing_column(self):
-        trades = pd.DataFrame({'other_column': [1, 2, 3]})
-        result = calculate_bet_price_stats(trades)
-        assert result['avg_bet_price'] == 0.5
-        assert result['median_bet_price'] == 0.5
+class TestFilterByWeeks:
+    """Test filter_by_weeks function."""
+
+    def test_filter_single_week(self):
+        df = pd.DataFrame({
+            "game_date": ["2025-09-05", "2025-09-12", "2025-09-19"],
+            "user_address": ["0x1", "0x2", "0x3"],
+        })
+
+        # Filter to week 1 only (Sep 3-10 for NFL)
+        result = filter_by_weeks(df, [1], "NFL")
+
+        assert len(result) == 1
+        assert result["user_address"].iloc[0] == "0x1"
+
+    def test_filter_multiple_weeks(self):
+        df = pd.DataFrame({
+            "game_date": ["2025-09-05", "2025-09-12", "2025-09-19"],
+            "user_address": ["0x1", "0x2", "0x3"],
+        })
+
+        # Filter to weeks 1-2 (Sep 3-17 for NFL)
+        result = filter_by_weeks(df, [1, 2], "NFL")
+
+        assert len(result) == 2
+
+    def test_empty_weeks_returns_original(self):
+        df = pd.DataFrame({
+            "game_date": ["2025-09-05"],
+            "user_address": ["0x1"],
+        })
+
+        result = filter_by_weeks(df, [], "NFL")
+
+        assert len(result) == 1
+
+
+class TestSportsConfig:
+    """Test SPORTS_CONFIG values."""
+
+    def test_all_sports_defined(self):
+        assert "NFL" in SPORTS_CONFIG
+        assert "NBA" in SPORTS_CONFIG
+        assert "CFB" in SPORTS_CONFIG
+        assert "CBB" in SPORTS_CONFIG
+
+    def test_required_fields(self):
+        for sport, config in SPORTS_CONFIG.items():
+            assert "input_csv" in config, f"{sport} missing input_csv"
+            assert "season_start" in config, f"{sport} missing season_start"
+            assert "total_weeks" in config, f"{sport} missing total_weeks"
+            assert "season_year" in config, f"{sport} missing season_year"
