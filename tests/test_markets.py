@@ -54,6 +54,14 @@ class TestIsMoneylineMarket:
         market = {'question': 'Chiefs vs Raiders Total Over 45.5'}
         assert is_moneyline_market(market) is False
 
+    def test_over_under_vs(self):
+        market = {'question': 'Over vs Under'}
+        assert is_moneyline_market(market) is False
+
+    def test_over_under_outcomes(self):
+        market = {'outcomes': ['Over', 'Under']}
+        assert is_moneyline_market(market) is False
+
 
 class TestDetermineWinner:
     def test_clear_winner(self):

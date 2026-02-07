@@ -1,5 +1,8 @@
 import os
 import time
+import sys
+import argparse
+from datetime import datetime
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
@@ -9,8 +12,16 @@ from typing import List, Optional
 # Import from shared modules
 from utils.shared_utils import (
     SPORTS_CONFIG,
+    LATE_PICK_THRESHOLD,
+    MIN_WIN_PCT,
+    MIN_GAMES_FOR_WIN_PCT,
+    MIN_GAMES,
+    MIN_WINS,
     normalize_is_correct,
+    coerce_numeric_series,
     parse_game_teams,
+    get_current_week,
+    get_last_n_weeks,
     filter_by_weeks,
     get_output_filename,
 )
@@ -29,7 +40,14 @@ from utils.menu_utils import select_sport, select_time_period
 # Data Loading and Transformation
 # =============================================================================
 
-def load_and_transform(input_csv: str) -> pd.DataFrame:
+def load_and_transform(
+    input_csv: str,
+    late_pick_threshold: float = LATE_PICK_THRESHOLD,
+    min_win_pct: float = MIN_WIN_PCT,
+    min_games_for_win_pct: int = MIN_GAMES_FOR_WIN_PCT,
+    min_games: int = MIN_GAMES,
+    min_wins: int = MIN_WINS,
+) -> pd.DataFrame:
     """
     Load CSV and transform to expected format.
 
@@ -57,19 +75,25 @@ def load_and_transform(input_csv: str) -> pd.DataFrame:
     # Filter out late picks (price >= 0.95)
     print("Filtering late picks...")
 
+    # Coerce price columns to numeric (remove commas if present)
+    df['yes_avg_price'] = coerce_numeric_series(df.get('yes_avg_price'))
+    df['no_avg_price'] = coerce_numeric_series(df.get('no_avg_price'))
+
     def get_pick_price(row):
         team_a, _ = parse_game_teams(row['game'])
         if row['user_pick'] == team_a:
-            return row.get('yes_avg_price', 0) or 0
+            price = row.get('yes_avg_price', 0)
+            return price if price is not None and not pd.isna(price) else 0
         else:
-            return row.get('no_avg_price', 0) or 0
+            price = row.get('no_avg_price', 0)
+            return price if price is not None and not pd.isna(price) else 0
 
     df['pick_price'] = df.apply(get_pick_price, axis=1)
 
     original_picks = len(df)
-    df = df[df['pick_price'] < 0.95]
+    df = df[df['pick_price'] < late_pick_threshold]
     excluded_picks = original_picks - len(df)
-    print(f"   Excluded {excluded_picks:,} late picks (price >= 0.95)")
+    print(f"   Excluded {excluded_picks:,} late picks (price >= {late_pick_threshold})")
     print(f"   Remaining: {len(df):,} picks")
 
     # Filter users by win rate (>= 70% with minimum 5 games)
@@ -82,34 +106,34 @@ def load_and_transform(input_csv: str) -> pd.DataFrame:
     user_stats['win_pct'] = (user_stats['wins'] / user_stats['total_games'] * 100).fillna(0)
 
     qualified_users = user_stats[
-        (user_stats['total_games'] < 5) |
-        (user_stats['win_pct'] >= 70)
+        (user_stats['total_games'] < min_games_for_win_pct) |
+        (user_stats['win_pct'] >= min_win_pct)
     ]['user_address']
 
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(qualified_users)]
     excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< 70% win rate with 5+ games)")
+    print(f"   Excluded {excluded_users:,} users (< {min_win_pct}% win rate with {min_games_for_win_pct}+ games)")
     print(f"   Remaining: {df['user_address'].nunique():,} users")
 
     # Filter users by minimum games
     print("Filtering by minimum games...")
     user_game_counts = df.groupby('user_address').size()
-    users_with_min_games = user_game_counts[user_game_counts >= 3].index
+    users_with_min_games = user_game_counts[user_game_counts >= min_games].index
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(users_with_min_games)]
     excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< 3 games)")
+    print(f"   Excluded {excluded_users:,} users (< {min_games} games)")
     print(f"   Remaining: {df['user_address'].nunique():,} users")
 
     # Filter users by minimum wins
     print("Filtering by minimum wins...")
     user_wins = df[df['result'] == 'won'].groupby('user_address').size()
-    users_with_min_wins = user_wins[user_wins >= 3].index
+    users_with_min_wins = user_wins[user_wins >= min_wins].index
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(users_with_min_wins)]
     excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< 3 wins)")
+    print(f"   Excluded {excluded_users:,} users (< {min_wins} wins)")
     print(f"   Remaining: {df['user_address'].nunique():,} users")
 
     return df
@@ -135,6 +159,24 @@ def calculate_user_stats(df: pd.DataFrame) -> pd.DataFrame:
     stats_df["win_pct"] = (100 * stats_df["wins"] / stats_df["total_decided"]).round(1)
     stats_df["win_pct"] = stats_df["win_pct"].fillna(0)
     stats_df = stats_df.drop(columns=["total_decided"])
+
+    # Optional PNL/ROI stats
+    if {"total_pnl", "yes_total_bought", "no_total_bought"}.issubset(df.columns):
+        df['total_pnl_num'] = coerce_numeric_series(df['total_pnl']).fillna(0.0)
+        df['total_bought_num'] = (
+            coerce_numeric_series(df['yes_total_bought']).fillna(0.0) +
+            coerce_numeric_series(df['no_total_bought']).fillna(0.0)
+        )
+
+        pnl_stats = df.groupby("user_address").agg(
+            total_pnl=("total_pnl_num", "sum"),
+            total_bought=("total_bought_num", "sum"),
+        ).reset_index()
+        pnl_stats["roi_pct"] = (
+            100 * pnl_stats["total_pnl"] / pnl_stats["total_bought"]
+        ).round(2)
+
+        stats_df = stats_df.merge(pnl_stats, on="user_address", how="left")
 
     # Win streak calculation
     sort_col = "game_start_time" if "game_start_time" in df.columns else "game_date"
@@ -177,6 +219,11 @@ def calculate_user_stats(df: pd.DataFrame) -> pd.DataFrame:
         stats_df['last_10'] = stats_df['last_10'].fillna(0).astype(int)
     else:
         stats_df['last_10'] = 0
+
+    # Ensure optional columns exist
+    for col in ["total_pnl", "total_bought", "roi_pct"]:
+        if col not in stats_df.columns:
+            stats_df[col] = 0
 
     # Sort by win_pct for consistent ordering
     stats_df = stats_df.sort_values(
@@ -262,7 +309,7 @@ def build_flat_table(df: pd.DataFrame, user_stats: pd.DataFrame, consensus: pd.D
 
     # Merge user stats
     flat_df = flat_df.merge(
-        user_stats[['user_address', 'games', 'wins', 'losses', 'win_pct', 'streak', 'last_10']],
+        user_stats[['user_address', 'games', 'wins', 'losses', 'win_pct', 'streak', 'last_10', 'total_pnl', 'roi_pct']],
         on='user_address',
         how='left'
     )
@@ -273,6 +320,10 @@ def build_flat_table(df: pd.DataFrame, user_stats: pd.DataFrame, consensus: pd.D
         on='game',
         how='left'
     )
+
+    # Majority/contrarian flags
+    flat_df['is_majority_pick'] = flat_df['pick'] == flat_df['majority_pick']
+    flat_df['is_contrarian'] = ~flat_df['is_majority_pick']
 
     # Calculate pick_pct (% who picked same team as this user)
     flat_df['pick_pct'] = flat_df.apply(
@@ -288,10 +339,11 @@ def build_flat_table(df: pd.DataFrame, user_stats: pd.DataFrame, consensus: pd.D
     # Convert game_date to datetime for Excel
     flat_df['game_date'] = pd.to_datetime(flat_df['game_date'])
 
-    # Select and order columns (13 columns)
+    # Select and order columns
     flat_df = flat_df[[
-        'user_address', 'games', 'wins', 'losses', 'win_pct', 'streak', 'last_10',
-        'game_display', 'game_date', 'pick', 'result', 'pick_price', 'pick_pct'
+        'user_address', 'games', 'wins', 'losses', 'win_pct', 'total_pnl', 'roi_pct', 'streak', 'last_10',
+        'game_display', 'game_date', 'pick', 'result', 'pick_price', 'pick_pct',
+        'majority_pick', 'is_majority_pick', 'is_contrarian', 'winner'
     ]]
 
     flat_df = flat_df.rename(columns={'game_display': 'game'})
@@ -303,11 +355,44 @@ def build_flat_table(df: pd.DataFrame, user_stats: pd.DataFrame, consensus: pd.D
     return flat_df
 
 
+def build_market_summary(df: pd.DataFrame, consensus: pd.DataFrame) -> pd.DataFrame:
+    """Build per-game summary table."""
+    if df.empty:
+        return pd.DataFrame()
+
+    game_dates = df[['game', 'game_date']].drop_duplicates()
+    total_counts = df.groupby('game').size().reset_index(name='total_picks')
+    pick_counts = df.groupby(['game', 'user_pick']).size().reset_index(name='pick_count')
+
+    summary = consensus.merge(game_dates, on='game', how='left')
+    summary = summary.merge(total_counts, on='game', how='left')
+    summary = summary.merge(
+        pick_counts,
+        left_on=['game', 'winner'],
+        right_on=['game', 'user_pick'],
+        how='left'
+    )
+
+    summary['winner_pick_pct'] = (summary['pick_count'] / summary['total_picks']).fillna(0.0)
+    summary['majority_correct'] = summary['winner'] == summary['majority_pick']
+    summary['consensus_a'] = (summary['consensus_a'] / 100).fillna(0.0)
+    summary['consensus_b'] = (summary['consensus_b'] / 100).fillna(0.0)
+    summary['game_date'] = pd.to_datetime(summary['game_date'], errors='coerce')
+
+    summary = summary[[
+        'game', 'game_date', 'total_picks',
+        'team_a', 'team_b', 'consensus_a', 'consensus_b',
+        'majority_pick', 'winner', 'winner_pick_pct', 'majority_correct'
+    ]]
+
+    return summary
+
+
 # =============================================================================
 # Excel Generation
 # =============================================================================
 
-def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str):
+def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str, market_summary: Optional[pd.DataFrame] = None):
     """Generate Excel file with flat table format."""
     if flat_df.empty:
         print("No data to generate Excel from")
@@ -320,13 +405,15 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str):
     ws = wb.active
     ws.title = title[:31]
 
-    # Column headers (13 columns)
+    # Column headers
     columns = [
         ('user_address', 'User'),
         ('games', 'Games'),
         ('wins', 'Wins'),
         ('losses', 'Losses'),
         ('win_pct', 'Win %'),
+        ('total_pnl', 'Total PnL'),
+        ('roi_pct', 'ROI %'),
         ('streak', 'Streak'),
         ('last_10', 'Last 10'),
         ('game', 'Game'),
@@ -335,6 +422,10 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str):
         ('result', 'Result'),
         ('pick_price', 'Price'),
         ('pick_pct', 'Pick %'),
+        ('majority_pick', 'Majority Pick'),
+        ('is_majority_pick', 'Majority?'),
+        ('is_contrarian', 'Contrarian?'),
+        ('winner', 'Winner'),
     ]
 
     center_align = Alignment(horizontal="center")
@@ -365,10 +456,22 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str):
                 cell.alignment = center_align
                 continue
 
-            # Handle pick_pct as percentage (stored as decimal, formatted as %)
-            if col_key == 'pick_pct' and pd.notna(value):
+            # Handle percent fields
+            if col_key in {'pick_pct'} and pd.notna(value):
                 cell = ws.cell(row=excel_row, column=col_idx, value=value)
                 cell.number_format = '0.0%'
+                cell.alignment = center_align
+                continue
+
+            if col_key in {'win_pct', 'roi_pct'} and pd.notna(value):
+                cell = ws.cell(row=excel_row, column=col_idx, value=value)
+                cell.number_format = '0.0'
+                cell.alignment = center_align
+                continue
+
+            if col_key == 'total_pnl' and pd.notna(value):
+                cell = ws.cell(row=excel_row, column=col_idx, value=value)
+                cell.number_format = '$#,##0.00'
                 cell.alignment = center_align
                 continue
 
@@ -396,31 +499,92 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str):
 
     print(f"   Writing row {total_rows:,}/{total_rows:,} (100.0%)")
 
-    # Freeze panes at H2 (after user stats, after header)
-    ws.freeze_panes = "H2"
+    # Freeze panes after user stats (after last_10)
+    ws.freeze_panes = "J2"
 
     # Auto-filter
     ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{total_rows + 1}"
 
-    # Adjust column widths (13 columns)
+    # Adjust column widths
     column_widths = {
         'A': 20,  # User
         'B': 7,   # Games
         'C': 6,   # Wins
         'D': 7,   # Losses
         'E': 7,   # Win %
-        'F': 7,   # Streak
-        'G': 8,   # Last 10
-        'H': 25,  # Game
-        'I': 12,  # Game Date
-        'J': 15,  # Pick
-        'K': 8,   # Result
-        'L': 7,   # Price
-        'M': 8,   # Pick %
+        'F': 10,  # Total PnL
+        'G': 7,   # ROI %
+        'H': 7,   # Streak
+        'I': 8,   # Last 10
+        'J': 25,  # Game
+        'K': 12,  # Game Date
+        'L': 15,  # Pick
+        'M': 8,   # Result
+        'N': 7,   # Price
+        'O': 8,   # Pick %
+        'P': 15,  # Majority Pick
+        'Q': 10,  # Majority?
+        'R': 12,  # Contrarian?
+        'S': 12,  # Winner
     }
 
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
+
+    # Optional market summary sheet
+    if market_summary is not None and not market_summary.empty:
+        ws2 = wb.create_sheet(title="markets")
+
+        summary_cols = [
+            ('game', 'Game'),
+            ('game_date', 'Game Date'),
+            ('total_picks', 'Total Picks'),
+            ('team_a', 'Team A'),
+            ('team_b', 'Team B'),
+            ('consensus_a', 'Consensus A %'),
+            ('consensus_b', 'Consensus B %'),
+            ('majority_pick', 'Majority Pick'),
+            ('winner', 'Winner'),
+            ('winner_pick_pct', 'Winner Pick %'),
+            ('majority_correct', 'Majority Correct'),
+        ]
+
+        for col_idx, (col_key, col_name) in enumerate(summary_cols, 1):
+            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.alignment = center_align
+
+        for row_idx, row in market_summary.iterrows():
+            excel_row = row_idx + 2
+            for col_idx, (col_key, _) in enumerate(summary_cols, 1):
+                value = row.get(col_key, "")
+                cell = ws2.cell(row=excel_row, column=col_idx, value=value)
+                cell.alignment = center_align
+
+                if col_key in {'consensus_a', 'consensus_b', 'winner_pick_pct'} and pd.notna(value):
+                    cell.number_format = '0.0%'
+                if col_key == 'game_date' and pd.notna(value):
+                    cell.number_format = 'YYYY-MM-DD'
+
+        # Column widths for summary
+        summary_widths = {
+            'A': 30,
+            'B': 12,
+            'C': 12,
+            'D': 20,
+            'E': 20,
+            'F': 14,
+            'G': 14,
+            'H': 18,
+            'I': 14,
+            'J': 14,
+            'K': 16,
+        }
+        for col_letter, width in summary_widths.items():
+            ws2.column_dimensions[col_letter].width = width
+
+        ws2.freeze_panes = "A2"
 
     # Save
     print("Saving file...")
@@ -432,7 +596,7 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str):
     print("\n" + "=" * 80)
     print("PREVIEW (First 10 rows)")
     print("=" * 80)
-    preview_cols = ['user_address', 'win_pct', 'game', 'pick', 'result', 'pick_pct']
+    preview_cols = ['user_address', 'win_pct', 'roi_pct', 'game', 'pick', 'result', 'pick_pct']
     preview_df = flat_df[preview_cols].head(10).copy()
     preview_df['user_address'] = preview_df['user_address'].apply(lambda x: x[:12] + "..." if len(str(x)) > 15 else x)
     preview_df['game'] = preview_df['game'].apply(lambda x: x[:20] + "..." if len(str(x)) > 23 else x)
@@ -447,21 +611,41 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str):
 # Main Operations
 # =============================================================================
 
-def do_generate(sport: str, weeks: Optional[List[int]] = None, is_season: bool = False):
+def do_generate(
+    sport: str,
+    weeks: Optional[List[int]] = None,
+    is_season: bool = False,
+    late_pick_threshold: float = LATE_PICK_THRESHOLD,
+    min_win_pct: float = MIN_WIN_PCT,
+    min_games_for_win_pct: int = MIN_GAMES_FOR_WIN_PCT,
+    min_games: int = MIN_GAMES,
+    min_wins: int = MIN_WINS,
+):
     """Main generation function."""
-    config = SPORTS_CONFIG[sport]
-    input_csv = config["input_csv"]
-    season_year = config["season_year"]
+    if sport.lower() == "all":
+        input_csv = "db_trades.csv"
+        season_year = datetime.now().year
+    else:
+        config = SPORTS_CONFIG[sport]
+        input_csv = config["input_csv"]
+        season_year = config["season_year"]
 
     if not os.path.exists(input_csv):
         print(f"Input file not found: {input_csv}")
         return
 
     # Load and transform data
-    df = load_and_transform(input_csv)
+    df = load_and_transform(
+        input_csv,
+        late_pick_threshold=late_pick_threshold,
+        min_win_pct=min_win_pct,
+        min_games_for_win_pct=min_games_for_win_pct,
+        min_games=min_games,
+        min_wins=min_wins,
+    )
 
     # Filter by weeks if specified
-    if weeks and not is_season:
+    if weeks and not is_season and sport.lower() != "all":
         week_range = f"{min(weeks)}-{max(weeks)}" if len(weeks) > 1 else str(weeks[0])
         print(f"Filtering to Week(s) {week_range}...")
         df = filter_by_weeks(df, weeks, sport)
@@ -480,12 +664,13 @@ def do_generate(sport: str, weeks: Optional[List[int]] = None, is_season: bool =
 
     # Build flat table
     flat_df = build_flat_table(df, user_stats, consensus)
+    market_summary = build_market_summary(df, consensus)
 
     # Generate output filename (using "analysis" prefix)
     output_file = get_output_filename(weeks, is_season, sport, prefix="analysis")
 
     # Generate Excel
-    generate_excel_flat(flat_df, output_file, title)
+    generate_excel_flat(flat_df, output_file, title, market_summary=market_summary)
 
 
 # =============================================================================
@@ -493,17 +678,87 @@ def do_generate(sport: str, weeks: Optional[List[int]] = None, is_season: bool =
 # =============================================================================
 
 def main():
-    # Step 1: Select sport
-    sport = select_sport(title="Analysis Generator (Flat Table)")
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser(description="Generate flat-table analysis Excel")
+        parser.add_argument(
+            "--sport",
+            type=str,
+            required=True,
+            help="Sport: NFL, NBA, CFB, CBB, or all",
+        )
+        parser.add_argument("--weeks", type=str, help="Weeks list (e.g., 5 or 3-5 or 1,2,3)")
+        parser.add_argument("--season", action="store_true", help="Full season")
+        parser.add_argument("--latest", action="store_true", help="Latest week")
+        parser.add_argument("--previous", action="store_true", help="Previous week")
+        parser.add_argument("--last5", action="store_true", help="Last 5 weeks")
+        parser.add_argument("--late-pick-threshold", type=float, default=LATE_PICK_THRESHOLD)
+        parser.add_argument("--min-win-pct", type=float, default=MIN_WIN_PCT)
+        parser.add_argument("--min-games-win-pct", type=int, default=MIN_GAMES_FOR_WIN_PCT)
+        parser.add_argument("--min-games", type=int, default=MIN_GAMES)
+        parser.add_argument("--min-wins", type=int, default=MIN_WINS)
+
+        args = parser.parse_args()
+
+        sport_arg = args.sport.strip().lower()
+        sport = "all" if sport_arg == "all" else sport_arg.upper()
+
+        def parse_weeks_arg(value: str) -> List[int]:
+            value = value.strip()
+            if "-" in value:
+                start, end = value.split("-", 1)
+                return list(range(int(start), int(end) + 1))
+            if "," in value:
+                return [int(v.strip()) for v in value.split(",") if v.strip()]
+            return [int(value)]
+
+        weeks = None
+        is_season = True
+
+        if args.season:
+            weeks = None
+            is_season = True
+        elif args.latest or args.previous or args.last5 or args.weeks:
+            if sport == "all":
+                print("Week filtering is not supported for all sports. Generating full season.")
+                weeks = None
+                is_season = True
+            else:
+                current_week = get_current_week(sport)
+                if args.latest:
+                    weeks = [current_week]
+                elif args.previous:
+                    weeks = [max(current_week - 1, 1)]
+                elif args.last5:
+                    weeks = get_last_n_weeks(5, sport)
+                elif args.weeks:
+                    weeks = parse_weeks_arg(args.weeks)
+                is_season = weeks is None
+
+        do_generate(
+            sport=sport,
+            weeks=weeks,
+            is_season=is_season,
+            late_pick_threshold=args.late_pick_threshold,
+            min_win_pct=args.min_win_pct,
+            min_games_for_win_pct=args.min_games_win_pct,
+            min_games=args.min_games,
+            min_wins=args.min_wins,
+        )
+        return
+
+    # Interactive mode
+    sport = select_sport(title="Analysis Generator (Flat Table)", include_all=True)
     if not sport or sport == "exit":
         return
 
-    # Step 2: Select time period
+    if sport == "all":
+        do_generate(sport=sport, weeks=None, is_season=True)
+        return
+
     weeks, is_season = select_time_period(sport)
     if weeks is None and not is_season:
         return
 
-    # Step 3: Generate analysis
     do_generate(sport=sport, weeks=weeks, is_season=is_season)
 
 

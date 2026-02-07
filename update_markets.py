@@ -39,6 +39,7 @@ import pandas as pd
 import json
 import os
 import logging
+import re
 
 # ------------------------------------------------------------------------------
 # Logging Configuration
@@ -76,6 +77,10 @@ CSV_PATH = "db_markets.csv"
 GAMMA_SPORTS_URL = "https://gamma-api.polymarket.com/sports"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
+# HTTP request timeout (seconds) and session for connection pooling
+REQUEST_TIMEOUT = 30
+SESSION = requests.Session()
+
 # Mapping of Polymarket series IDs to sport abbreviations
 # These IDs are specific to Polymarket's internal categorization
 SERIES_IDS = {
@@ -96,6 +101,22 @@ MIN_YEAR = 2025
 # When an outcome's price exceeds this, consider it the winner
 # (Markets resolve to ~1.0 for winning outcome, ~0.0 for losing)
 WINNER_PRICE_THRESHOLD = 0.95
+
+
+def coerce_bool(value) -> bool:
+    """Coerce common truthy/falsey values to bool."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return bool(int(value))
+    text = str(value).strip().lower()
+    if text in {"true", "t", "1", "yes", "y"}:
+        return True
+    if text in {"false", "f", "0", "no", "n", ""}:
+        return False
+    return False
 
 
 # ------------------------------------------------------------------------------
@@ -174,6 +195,37 @@ def parse_json_field(value):
     return value
 
 
+_NON_MONEYLINE_KEYWORDS = re.compile(r"\b(spread|total|over|under|prop|props)\b", re.IGNORECASE)
+_NON_MONEYLINE_OUTCOMES = {"over", "under", "yes", "no", "home", "away"}
+
+
+def _has_non_moneyline_keywords(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_NON_MONEYLINE_KEYWORDS.search(text))
+
+
+def _outcomes_look_non_moneyline(outcomes) -> bool:
+    if not isinstance(outcomes, list):
+        return False
+    if len(outcomes) != 2:
+        return True
+    normalized = [str(o).strip().lower() for o in outcomes if o is not None]
+    if any(o in _NON_MONEYLINE_OUTCOMES for o in normalized):
+        return True
+    if any(o.startswith("over") or o.startswith("under") for o in normalized):
+        return True
+    return False
+
+
+def _has_vs_marker(text: str) -> bool:
+    if not text:
+        return False
+    if " @ " in text or " at " in text:
+        return True
+    return bool(re.search(r"\bvs\.?\b", text, re.IGNORECASE))
+
+
 def is_moneyline_market(market):
     """
     Determine if a market is a moneyline (win/lose) market.
@@ -186,8 +238,7 @@ def is_moneyline_market(market):
     
     Detection Strategy:
     1. Check sportsMarketType field (most reliable)
-    2. Fallback: Parse question text for indicators
-       - "vs" in title without "Spread" or "Total" = likely moneyline
+    2. Fallback: Use outcomes + question/slug/title heuristics
     
     Args:
         market: Market dict from Gamma API
@@ -196,22 +247,33 @@ def is_moneyline_market(market):
         True if this is a moneyline market, False otherwise
     """
     market_type = market.get('sportsMarketType')
-    
-    if market_type == 'moneyline':
+    market_type_norm = str(market_type).strip().lower() if market_type is not None else ""
+
+    if market_type_norm:
+        return market_type_norm == 'moneyline'
+
+    # Fallback: inspect outcomes and text fields
+    outcomes = parse_json_field(market.get('outcomes'))
+    if _outcomes_look_non_moneyline(outcomes):
+        return False
+
+    question = market.get('question', '') or ''
+    slug = market.get('slug', '') or ''
+    title = market.get('title', '') or ''
+    combined = f"{question} {slug} {title}"
+
+    # Explicit non-moneyline keywords
+    if _has_non_moneyline_keywords(combined):
+        return False
+
+    # Explicit moneyline indicator
+    if 'moneyline' in combined.lower():
         return True
-    
-    # Fallback: check question text if no explicit market type
-    if not market_type:
-        question = market.get('question', '')
-        has_vs = ' vs ' in question
-        is_spread = 'Spread' in question
-        is_total = 'Total' in question
-        
-        if 'Moneyline' in question:
-            return True
-        if has_vs and not is_spread and not is_total:
-            return True
-    
+
+    # Team vs team indicator
+    if _has_vs_marker(question) or _has_vs_marker(title):
+        return True
+
     return False
 
 
@@ -304,7 +366,7 @@ def fetch_sports():
     print("Fetching sports data from Polymarket Gamma API...")
     
     try:
-        response = requests.get(GAMMA_SPORTS_URL, timeout=30)
+        response = SESSION.get(GAMMA_SPORTS_URL, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         sports_data = response.json()
     except json.JSONDecodeError as e:
@@ -370,7 +432,7 @@ def fetch_events_for_series(series_id):
             }
             
             try:
-                response = requests.get(GAMMA_EVENTS_URL, params=params, timeout=30)
+                response = SESSION.get(GAMMA_EVENTS_URL, params=params, timeout=REQUEST_TIMEOUT)
                 response.raise_for_status()
                 data = response.json()
             except requests.exceptions.RequestException as e:
@@ -433,7 +495,7 @@ def process_market(market, event, sport, series):
     outcome_prices = parse_json_field(market.get('outcomePrices'))
     
     # Determine resolution status
-    is_resolved = market.get('resolved', False) or market.get('closed', False)
+    is_resolved = coerce_bool(market.get('resolved', False)) or coerce_bool(market.get('closed', False))
     
     # Determine winner for resolved markets
     winner = determine_winner(outcomes, outcome_prices) if is_resolved else "Pending"
@@ -574,15 +636,34 @@ def main():
     except Exception as e:
         logger.warning(f"Some game_start_time values could not be parsed: {e}")
         df['game_start_time'] = pd.to_datetime(df['game_start_time'], errors='coerce')
-    df = df.sort_values('game_start_time', ascending=False)
+    # Normalize is_resolved to bool for reliable downstream parsing
+    if 'is_resolved' in df.columns:
+        df['is_resolved'] = df['is_resolved'].apply(coerce_bool)
+    else:
+        df['is_resolved'] = False
 
-    # Deduplicate by condition_id (keep first = most recent due to sort above)
+    # Prefer resolved markets and known winners when deduplicating
+    df['winning_outcome'] = df['winning_outcome'].fillna('')
+    df['_has_winner'] = df['winning_outcome'].astype(str).str.strip().ne('') & df['winning_outcome'].ne('Pending')
+    df = df.sort_values(
+        ['_has_winner', 'is_resolved', 'game_start_time'],
+        ascending=[False, False, False]
+    )
+
+    # Deduplicate by condition_id (keep best record based on sort above)
     original_count = len(df)
     df = df.drop_duplicates(subset=['condition_id'], keep='first')
     dedup_count = len(df)
     if original_count != dedup_count:
         print(f"Deduplicated: {original_count} -> {dedup_count} markets")
         logger.info(f"Deduplicated {original_count - dedup_count} duplicate markets")
+
+    # Clean helper column
+    if '_has_winner' in df.columns:
+        df = df.drop(columns=['_has_winner'])
+
+    # Final sort by game time (most recent first)
+    df = df.sort_values('game_start_time', ascending=False)
 
     # Format game_start_time for Excel date recognition
     # Handle NaT values to avoid 'NaT' strings in output

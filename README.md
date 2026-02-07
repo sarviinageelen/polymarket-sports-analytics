@@ -133,6 +133,8 @@ Options:
   --force-reprocess    Reprocess all markets (ignore cache)
   --verbose            Show detailed per-user output
   --max-users N        Limit users per market (for testing)
+  --sport {all,nfl,nba,cfb,cbb}  Filter by sport
+  --pick-basis {total_bought,amount}  Classify pick by total bought or current amount
 ```
 
 #### update_picks.py
@@ -141,12 +143,25 @@ python update_picks.py
 ```
 Runs an interactive menu to choose sport and time window (latest week, previous week, last 5 weeks, full season). Generates a leaderboard-style Excel with a pick-by-pick grid.
 
+CLI mode:
+```bash
+python update_picks.py --sport NFL --weeks 5
+python update_picks.py --sport NBA --last5
+python update_picks.py --sport all --season
+```
+
 #### update_analyze.py
 
 ```bash
 python update_analyze.py
 ```
 Runs an interactive menu to choose sport and time window. Generates a flat-table Excel analysis with one row per user per game, including entry prices, consensus percentages, and pick results.
+
+CLI mode:
+```bash
+python update_analyze.py --sport CFB --weeks 3-5
+python update_analyze.py --sport all --season
+```
 
 ### Example Workflows
 
@@ -249,7 +264,12 @@ The generated Excel file contains:
 | losses | Incorrect predictions |
 | win_pct | Accuracy percentage |
 | win_streak | Current winning streak |
+| loss_streak | Current losing streak |
 | last_10 | Correct in last 10 games |
+| roi_pct | ROI percentage (total_pnl / total_bought) |
+| total_pnl | Total profit/loss |
+| contrarian_win_pct | Win % when picking against majority |
+| contrarian_games | Number of contrarian picks |
 | [Game columns] | Pick for each game (team name) |
 
 ### Excel Analysis Structure (Flat Table)
@@ -263,6 +283,8 @@ The analysis Excel file (`update_analyze.py`) contains a flat table with one row
 | Wins | Correct predictions |
 | Losses | Incorrect predictions |
 | Win % | Accuracy percentage |
+| Total PnL | Total profit/loss |
+| ROI % | ROI percentage (total_pnl / total_bought) |
 | Streak | Current winning streak |
 | Last 10 | Correct in last 10 games |
 | Game | Match title (Team A vs Team B) |
@@ -271,6 +293,13 @@ The analysis Excel file (`update_analyze.py`) contains a flat table with one row
 | Result | won/lost/pending |
 | Price | Entry price when pick was made |
 | Pick % | Percentage of users who made the same pick |
+| Majority Pick | Team picked by the majority |
+| Majority? | Whether the pick matches the majority |
+| Contrarian? | Whether the pick fades the majority |
+| Winner | Winner (if resolved) |
+
+The analysis workbook also includes a **markets** sheet with per-game summaries
+(consensus percentages, majority pick, winner, and winner pick rate).
 
 ## Filtering Logic
 
@@ -284,6 +313,9 @@ The analysis Excel file (`update_analyze.py`) contains a flat table with one row
 - **Late entries** at >95% probability offer minimal signal and often represent near-certainty outcomes
 - **Accuracy filtering** surfaces consistently successful forecasters, not lucky streaks
 - **Minimum games** ensures statistical significance
+
+Filters can be overridden in CLI mode via:
+`--late-pick-threshold`, `--min-win-pct`, `--min-games-win-pct`, `--min-games`, `--min-wins`.
 
 ## Testing
 

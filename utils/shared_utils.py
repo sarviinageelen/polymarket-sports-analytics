@@ -18,6 +18,13 @@ from typing import List, Optional, Tuple
 
 OUTPUT_DIR = "."
 
+# Filtering thresholds (defaults)
+LATE_PICK_THRESHOLD = 0.95
+MIN_WIN_PCT = 70.0
+MIN_GAMES_FOR_WIN_PCT = 5
+MIN_GAMES = 3
+MIN_WINS = 3
+
 # Sport-specific configurations for 2025-2026 seasons
 SPORTS_CONFIG = {
     "NFL": {
@@ -205,6 +212,21 @@ def normalize_is_correct(value) -> Optional[bool]:
     return None
 
 
+def coerce_numeric_series(series: pd.Series) -> pd.Series:
+    """
+    Convert a Series to numeric values, removing commas when present.
+
+    Args:
+        series: pandas Series with numeric strings (may include commas)
+
+    Returns:
+        Series of floats with non-parsable values set to NaN
+    """
+    if series is None:
+        return pd.Series([], dtype="float64")
+    return pd.to_numeric(series.astype(str).str.replace(",", ""), errors="coerce")
+
+
 def parse_game_teams(game_str) -> Tuple[str, str]:
     """
     Parse 'Team A vs Team B' or 'Team A vs. Team B' into (team_a, team_b).
@@ -293,9 +315,12 @@ def get_output_filename(
     Returns:
         Output filepath like "leaderboard_nfl_week_5.xlsx"
     """
-    config = SPORTS_CONFIG[sport]
-    season_year = config["season_year"]
     sport_lower = sport.lower()
+    if sport_lower == "all":
+        season_year = datetime.now().year
+    else:
+        config = SPORTS_CONFIG[sport]
+        season_year = config["season_year"]
 
     if is_season or weeks is None:
         return os.path.join(OUTPUT_DIR, f"{prefix}_{sport_lower}_season_{season_year}.xlsx")

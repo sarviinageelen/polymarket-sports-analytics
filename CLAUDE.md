@@ -25,6 +25,8 @@ python update_trades.py --unresolved-only    # Only active markets
 python update_trades.py --force-reprocess    # Ignore cache
 python update_trades.py --verbose            # Detailed output
 python update_trades.py --max-users N        # Limit users (testing)
+python update_trades.py --sport nfl          # Filter by sport
+python update_trades.py --pick-basis amount  # Classify picks by amount held
 ```
 
 ## Architecture
