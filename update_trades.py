@@ -57,6 +57,7 @@ import time
 import logging
 import pandas as pd
 import sys
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -101,6 +102,12 @@ ORDERBOOK_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h00
 # All amounts from subgraph are in base units (divide by 10^6 to get USDC)
 COLLATERAL_SCALE = 1_000_000
 
+# HTTP request timeout (seconds)
+REQUEST_TIMEOUT = 30
+
+# Shared HTTP session for connection pooling
+SESSION = requests.Session()
+
 # Rate Limiting Configuration
 # Goldsky public endpoints allow ~50 requests per 10 seconds
 # Using 25 req/s provides headroom while maintaining good throughput
@@ -111,9 +118,84 @@ RATE_LIMIT_DELAY = 1.0 / RATE_LIMIT_REQUESTS_PER_SECOND  # ~0.04 seconds between
 MAX_RETRIES = 3        # Maximum attempts before giving up
 RETRY_DELAY = 2        # Base delay in seconds (uses exponential backoff)
 
+# Batch fallback configuration for heavy GraphQL queries
+MIN_BATCH_SIZE = 50    # Smallest batch size before giving up on retries
+
+# Formatting defaults
+PRICE_DECIMALS = 6
+
+# Default pick-basis for classify user picks (total_bought preserves legacy behavior)
+DEFAULT_PICK_BASIS = "total_bought"
+
 # In-memory cache for condition data to avoid redundant API calls
 # Key: condition_id (lowercase), Value: condition entity from subgraph
 _condition_cache = {}
+
+# Boolean parsing helpers (CSV strings -> bool)
+BOOL_TRUE = {"true", "t", "1", "yes", "y"}
+BOOL_FALSE = {"false", "f", "0", "no", "n", ""}
+
+# Fallback filters for non-moneyline markets (when db_markets has mixed types)
+_NON_MONEYLINE_KEYWORDS = re.compile(r"\b(?:spread|total|over|under|prop|props)\b", re.IGNORECASE)
+_NON_MONEYLINE_OUTCOMES = {"over", "under", "yes", "no", "home", "away"}
+
+
+def _filter_moneyline_markets(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter DataFrame to moneyline markets using available metadata.
+
+    Uses sports_market_type when present, then falls back to outcomes/title heuristics.
+    """
+    original = len(df)
+
+    # Prefer explicit market type if available
+    if "sports_market_type" in df.columns:
+        mt = df["sports_market_type"].fillna("").astype(str).str.lower().str.strip()
+        df = df[(mt == "moneyline") | (mt == "")]
+
+    # Exclude obvious non-moneyline outcomes
+    for col in ("outcome_team_a", "outcome_team_b"):
+        if col in df.columns:
+            norm = df[col].fillna("").astype(str).str.lower().str.strip()
+            df = df[~norm.isin(_NON_MONEYLINE_OUTCOMES)]
+
+    # Exclude non-moneyline keywords in match title
+    if "match_title" in df.columns:
+        df = df[~df["match_title"].fillna("").astype(str).str.contains(_NON_MONEYLINE_KEYWORDS)]
+
+    removed = original - len(df)
+    if removed > 0:
+        print(f"Filtered out {removed} non-moneyline markets from input CSV")
+    return df
+
+
+def _coerce_bool(value) -> bool:
+    """Coerce common string/number representations to bool."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return bool(int(value))
+    text = str(value).strip().lower()
+    if text in BOOL_TRUE:
+        return True
+    if text in BOOL_FALSE:
+        return False
+    return False
+
+
+def _read_csv_with_bool(path: str, usecols: Optional[List[str]] = None) -> pd.DataFrame:
+    """Read CSV and coerce `is_resolved` to boolean if present."""
+    df = pd.read_csv(
+        path,
+        usecols=usecols,
+        true_values=list(BOOL_TRUE),
+        false_values=list(BOOL_FALSE),
+    )
+    if "is_resolved" in df.columns:
+        df["is_resolved"] = df["is_resolved"].apply(_coerce_bool)
+    return df
 
 
 # ============================================================================
@@ -216,7 +298,7 @@ def query_subgraph(url: str, query: str, variables: Optional[Dict] = None) -> Di
             # Rate limiting: wait before making request
             time.sleep(RATE_LIMIT_DELAY)
 
-            response = requests.post(url, json=payload)
+            response = SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
 
             # Handle rate limiting (429 Too Many Requests)
             if response.status_code == 429:
@@ -232,6 +314,13 @@ def query_subgraph(url: str, query: str, variables: Optional[Dict] = None) -> Di
 
             result = response.json()
             if "errors" in result:
+                # Retry on known transient store timeouts
+                errors_text = " ".join([str(e) for e in result.get("errors", [])]).lower()
+                if ("statement timeout" in errors_text or "failed to get entities from store" in errors_text) and attempt < MAX_RETRIES - 1:
+                    wait_time = RETRY_DELAY * (attempt + 1)
+                    print(f"  Warning: GraphQL timeout, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
                 raise Exception(f"GraphQL query failed: {result['errors']}")
             
             if "data" not in result:
@@ -249,6 +338,44 @@ def query_subgraph(url: str, query: str, variables: Optional[Dict] = None) -> Di
                 raise Exception(f"Request failed after {MAX_RETRIES} retries: {e}")
 
     raise Exception("Query failed after all retries")
+
+
+def _is_retryable_graphql_error(exc: Exception) -> bool:
+    """Detect retryable GraphQL/store timeout errors."""
+    msg = str(exc).lower()
+    return ("statement timeout" in msg) or ("failed to get entities from store" in msg) or ("canceling statement due to statement timeout" in msg)
+
+
+def get_batch_user_positions_resilient(
+    user_addresses: List[str],
+    position_ids: List[str],
+    min_batch_size: int = MIN_BATCH_SIZE,
+    depth: int = 0
+) -> Dict[str, Dict]:
+    """
+    Fetch batch user positions with automatic fallback for timeout-heavy queries.
+
+    On transient store timeouts, this function splits the batch into smaller
+    chunks until it succeeds or reaches min_batch_size.
+    """
+    try:
+        return get_batch_user_positions(user_addresses, position_ids)
+    except Exception as e:
+        if _is_retryable_graphql_error(e) and len(user_addresses) > min_batch_size:
+            mid = len(user_addresses) // 2
+            left_users = user_addresses[:mid]
+            right_users = user_addresses[mid:]
+
+            print(
+                f"  Warning: Batch query timed out (size={len(user_addresses)}). "
+                f"Splitting into {len(left_users)} + {len(right_users)}..."
+            )
+
+            left = get_batch_user_positions_resilient(left_users, position_ids, min_batch_size, depth + 1)
+            right = get_batch_user_positions_resilient(right_users, position_ids, min_batch_size, depth + 1)
+            left.update(right)
+            return left
+        raise
 
 
 def get_condition(condition_id: str, use_cache: bool = True) -> Optional[Dict]:
@@ -480,7 +607,24 @@ def format_number(value, decimals=2):
     return f"{rounded:,.{decimals}f}"
 
 
-def determine_user_pick(yes_position, no_position, match_title):
+def as_number(value, decimals=2):
+    """Return numeric value rounded to decimals (None for missing)."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), decimals)
+    except (TypeError, ValueError):
+        return None
+
+
+def determine_user_pick(
+    yes_position,
+    no_position,
+    match_title,
+    outcome_team_a: Optional[str] = None,
+    outcome_team_b: Optional[str] = None,
+    pick_basis: str = DEFAULT_PICK_BASIS,
+):
     """
     Determine which team/outcome the user bet on based on position sizes.
     
@@ -504,22 +648,36 @@ def determine_user_pick(yes_position, no_position, match_title):
     """
     yes_bought = float(yes_position["totalBought"]) if yes_position else 0.0
     no_bought = float(no_position["totalBought"]) if no_position else 0.0
+    yes_amount = float(yes_position["amount"]) if yes_position and "amount" in yes_position else 0.0
+    no_amount = float(no_position["amount"]) if no_position and "amount" in no_position else 0.0
 
     # No positions at all
-    if yes_bought == 0 and no_bought == 0:
+    if yes_bought == 0 and no_bought == 0 and yes_amount == 0 and no_amount == 0:
         return "NONE"
 
-    # Parse team names from match_title (format: "Team A vs Team B" or "Team A vs. Team B")
-    team_a = ""
-    team_b = ""
-    if match_title and " vs" in match_title.lower():
+    # Prefer outcome team labels (from db_markets.csv) to avoid abbreviation mismatches
+    team_a = (outcome_team_a or "").strip()
+    team_b = (outcome_team_b or "").strip()
+
+    # Fallback: parse from match_title if outcome labels missing
+    if (not team_a or not team_b) and match_title and " vs" in match_title.lower():
         parts = match_title.replace(" vs. ", " vs ").split(" vs ")
         if len(parts) == 2:
-            team_a = parts[0].strip()
-            team_b = parts[1].strip()
+            team_a = team_a or parts[0].strip()
+            team_b = team_b or parts[1].strip()
 
     # Determine which side they bet
     # Equal bets on both sides: default to YES (Team A) as tiebreaker
+    if pick_basis == "amount":
+        if yes_amount == 0 and no_amount == 0:
+            # Fallback to total_bought if no current holdings
+            pass
+        elif yes_amount >= no_amount:
+            return team_a if team_a else "YES"
+        else:
+            return team_b if team_b else "NO"
+
+    # Default: total_bought (legacy behavior)
     if yes_bought >= no_bought:
         return team_a if team_a else "YES"
     else:
@@ -554,7 +712,8 @@ def build_csv_row(
     condition_id: str,
     user_address: str,
     results: Dict,
-    market_metadata: Optional[Dict] = None
+    market_metadata: Optional[Dict] = None,
+    pick_basis: str = DEFAULT_PICK_BASIS,
 ) -> Dict:
     """
     Build a complete CSV row dict from PNL calculation results.
@@ -581,7 +740,14 @@ def build_csv_row(
     # Determine user's pick and if it was correct
     match_title = metadata.get("match_title", "")
     winning_outcome = metadata.get("winning_outcome", "")
-    user_pick = determine_user_pick(yes_pos, no_pos, match_title)
+    user_pick = determine_user_pick(
+        yes_pos,
+        no_pos,
+        match_title,
+        outcome_team_a=metadata.get("outcome_team_a", ""),
+        outcome_team_b=metadata.get("outcome_team_b", ""),
+        pick_basis=pick_basis,
+    )
     is_correct = calculate_is_correct_pick(user_pick, winning_outcome)
 
     return {
@@ -594,23 +760,29 @@ def build_csv_row(
         "user_address": user_address,
         "user_pick": user_pick,
         "is_correct_pick": is_correct,
-        "yes_current_holdings": format_number(float(yes_pos["amount"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
-        "yes_avg_price": format_number(float(yes_pos["avgPrice"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
-        "yes_total_bought": format_number(float(yes_pos["totalBought"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
-        "yes_current_price": format_number(results["YES"]["current_price"] / COLLATERAL_SCALE if results["YES"]["current_price"] is not None else None),
-        "yes_realized_pnl": format_number(results["YES"]["realized_pnl"] / COLLATERAL_SCALE),
-        "yes_unrealized_pnl": format_number(results["YES"]["unrealized_pnl"] / COLLATERAL_SCALE),
-        "yes_total_pnl": format_number(results["YES"]["total_pnl"] / COLLATERAL_SCALE),
-        "no_current_holdings": format_number(float(no_pos["amount"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
-        "no_avg_price": format_number(float(no_pos["avgPrice"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
-        "no_total_bought": format_number(float(no_pos["totalBought"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
-        "no_current_price": format_number(results["NO"]["current_price"] / COLLATERAL_SCALE if results["NO"]["current_price"] is not None else None),
-        "no_realized_pnl": format_number(results["NO"]["realized_pnl"] / COLLATERAL_SCALE),
-        "no_unrealized_pnl": format_number(results["NO"]["unrealized_pnl"] / COLLATERAL_SCALE),
-        "no_total_pnl": format_number(results["NO"]["total_pnl"] / COLLATERAL_SCALE),
-        "total_realized_pnl": format_number((results["YES"]["realized_pnl"] + results["NO"]["realized_pnl"]) / COLLATERAL_SCALE),
-        "total_unrealized_pnl": format_number((results["YES"]["unrealized_pnl"] + results["NO"]["unrealized_pnl"]) / COLLATERAL_SCALE),
-        "total_pnl": format_number((results["YES"]["total_pnl"] + results["NO"]["total_pnl"]) / COLLATERAL_SCALE)
+        "yes_current_holdings": as_number(float(yes_pos["amount"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
+        "yes_avg_price": as_number(float(yes_pos["avgPrice"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0, decimals=PRICE_DECIMALS),
+        "yes_total_bought": as_number(float(yes_pos["totalBought"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
+        "yes_current_price": as_number(
+            results["YES"]["current_price"] / COLLATERAL_SCALE if results["YES"]["current_price"] is not None else None,
+            decimals=PRICE_DECIMALS,
+        ),
+        "yes_realized_pnl": as_number(results["YES"]["realized_pnl"] / COLLATERAL_SCALE),
+        "yes_unrealized_pnl": as_number(results["YES"]["unrealized_pnl"] / COLLATERAL_SCALE),
+        "yes_total_pnl": as_number(results["YES"]["total_pnl"] / COLLATERAL_SCALE),
+        "no_current_holdings": as_number(float(no_pos["amount"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
+        "no_avg_price": as_number(float(no_pos["avgPrice"]) / COLLATERAL_SCALE if no_pos is not None else 0.0, decimals=PRICE_DECIMALS),
+        "no_total_bought": as_number(float(no_pos["totalBought"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
+        "no_current_price": as_number(
+            results["NO"]["current_price"] / COLLATERAL_SCALE if results["NO"]["current_price"] is not None else None,
+            decimals=PRICE_DECIMALS,
+        ),
+        "no_realized_pnl": as_number(results["NO"]["realized_pnl"] / COLLATERAL_SCALE),
+        "no_unrealized_pnl": as_number(results["NO"]["unrealized_pnl"] / COLLATERAL_SCALE),
+        "no_total_pnl": as_number(results["NO"]["total_pnl"] / COLLATERAL_SCALE),
+        "total_realized_pnl": as_number((results["YES"]["realized_pnl"] + results["NO"]["realized_pnl"]) / COLLATERAL_SCALE),
+        "total_unrealized_pnl": as_number((results["YES"]["unrealized_pnl"] + results["NO"]["unrealized_pnl"]) / COLLATERAL_SCALE),
+        "total_pnl": as_number((results["YES"]["total_pnl"] + results["NO"]["total_pnl"]) / COLLATERAL_SCALE)
     }
 
 
@@ -652,7 +824,8 @@ def write_to_csv(
     results: Dict,
     csv_file: Optional[str] = None,
     verbose: bool = True,
-    market_metadata: Optional[Dict] = None
+    market_metadata: Optional[Dict] = None,
+    pick_basis: str = DEFAULT_PICK_BASIS,
 ):
     """
     Write a single user's PNL result to CSV file.
@@ -671,7 +844,7 @@ def write_to_csv(
     if csv_file is None:
         csv_file = "db_trades.csv"
     
-    row = build_csv_row(condition_id, user_address, results, market_metadata)
+    row = build_csv_row(condition_id, user_address, results, market_metadata, pick_basis=pick_basis)
     write_rows_to_csv([row], csv_file)
     
     if verbose:
@@ -826,7 +999,8 @@ def calculate_pnl_for_all_users(
     verbose: bool = False,
     max_users: Optional[int] = None,
     batch_size: int = 500,  # Increased from 100 for faster processing
-    market_metadata: Optional[Dict] = None
+    market_metadata: Optional[Dict] = None,
+    pick_basis: str = DEFAULT_PICK_BASIS,
 ):
     """
     Calculate PNL for every trader in a resolved market.
@@ -903,8 +1077,8 @@ def calculate_pnl_for_all_users(
             print(f"\n[Batch {batch_num + 1}/{num_batches}] Fetching {len(batch_users)} users...")
 
         try:
-            # Fetch all positions for this batch
-            batch_positions = get_batch_user_positions(batch_users, position_ids)
+            # Fetch all positions for this batch (with timeout-resilient fallback)
+            batch_positions = get_batch_user_positions_resilient(batch_users, position_ids)
 
             batch_pnl_sum = 0.0
 
@@ -956,7 +1130,13 @@ def calculate_pnl_for_all_users(
                     total_pnl_sum += total_pnl
 
                     # Build row for batch CSV write (much faster than per-user writes)
-                    row = build_csv_row(condition_id, user_address, results, market_metadata)
+                    row = build_csv_row(
+                        condition_id,
+                        user_address,
+                        results,
+                        market_metadata,
+                        pick_basis=pick_basis,
+                    )
                     rows_to_write.append(row)
 
                     successful += 1
@@ -1038,13 +1218,13 @@ def get_processed_markets(output_csv: str) -> dict:
         return {}
 
     try:
-        df = pd.read_csv(output_csv, usecols=['condition_id', 'is_resolved', 'winning_outcome'])
+        df = _read_csv_with_bool(output_csv, usecols=['condition_id', 'is_resolved', 'winning_outcome'])
         # Get unique condition_id with their resolution status (take first occurrence)
         unique_markets = df.drop_duplicates(subset=['condition_id'])
         result = {}
         for _, row in unique_markets.iterrows():
             result[row['condition_id']] = {
-                'is_resolved': row['is_resolved'],
+                'is_resolved': _coerce_bool(row['is_resolved']),
                 'winning_outcome': str(row['winning_outcome']) if pd.notna(row['winning_outcome']) else ''
             }
         return result
@@ -1060,7 +1240,8 @@ def process_all_markets(
     max_users_per_market: Optional[int] = None,
     force_reprocess: bool = False,
     market_filter: str = "all",
-    sport_filter: str = "all"
+    sport_filter: str = "all",
+    pick_basis: str = DEFAULT_PICK_BASIS,
 ):
     """
     Process markets and calculate PNL for every user.
@@ -1107,7 +1288,7 @@ def process_all_markets(
     logger.info(f"Starting trade processing from {markets_csv}")
     
     # Read markets CSV
-    markets_df = pd.read_csv(markets_csv)
+    markets_df = _read_csv_with_bool(markets_csv)
 
     # Filter by sport if specified
     if sport_filter != "all":
@@ -1115,6 +1296,9 @@ def process_all_markets(
         if len(markets_df) == 0:
             print(f"No {sport_filter.upper()} markets found.")
             return
+
+    # Ensure only moneyline markets are processed
+    markets_df = _filter_moneyline_markets(markets_df)
 
     # Filter markets based on market_filter parameter
     if market_filter == "resolved":
@@ -1166,7 +1350,7 @@ def process_all_markets(
     if markets_to_reprocess and os.path.isfile(output_csv):
         print(f"Re-processing {len(markets_to_reprocess)} markets (unresolved + newly resolved)...")
         try:
-            df_existing = pd.read_csv(output_csv)
+            df_existing = pd.read_csv(output_csv, low_memory=False)
             df_existing = df_existing[~df_existing['condition_id'].isin(markets_to_reprocess)]
             df_existing.to_csv(output_csv, index=False)
             # Update processed_markets to exclude re-processing markets
@@ -1238,8 +1422,10 @@ def process_all_markets(
                 "sport": str(market['sport']),
                 "match_title": str(market['match_title']),
                 "game_start_time": game_time_str,
-                "is_resolved": str(market['is_resolved']),
-                "winning_outcome": str(market['winning_outcome'])
+                "is_resolved": _coerce_bool(market['is_resolved']),
+                "winning_outcome": str(market['winning_outcome']),
+                "outcome_team_a": str(market.get('outcome_team_a', "")),
+                "outcome_team_b": str(market.get('outcome_team_b', "")),
             }
 
             # Calculate PNL for all users in this market
@@ -1248,7 +1434,8 @@ def process_all_markets(
                 output_csv=output_csv,
                 verbose=verbose,
                 max_users=max_users_per_market,
-                market_metadata=market_metadata
+                market_metadata=market_metadata,
+                pick_basis=pick_basis,
             )
 
             # Track cumulative statistics
@@ -1343,24 +1530,42 @@ def segment_trades_by_sport(trades_csv: str = "db_trades.csv"):
         print(f"  Trades file not found: {trades_csv}")
         return
     
-    df = pd.read_csv(trades_csv)
-    
     sport_files = {
         "nfl": "db_trades_nfl.csv",
         "nba": "db_trades_nba.csv",
         "cfb": "db_trades_cfb.csv",
         "cbb": "db_trades_cbb.csv",
     }
-    
-    # Normalize sport column
-    df['sport'] = df['sport'].str.lower().str.strip()
-    
+
+    # Prepare output files (overwrite existing)
+    file_written = {sport: False for sport in sport_files}
+    counts = {sport: 0 for sport in sport_files}
+    for filename in sport_files.values():
+        if os.path.isfile(filename):
+            os.remove(filename)
+
+    # Stream through CSV to avoid loading large files into memory
+    for chunk in pd.read_csv(trades_csv, chunksize=200_000, dtype=str, low_memory=False):
+        # Normalize sport column
+        chunk['sport'] = chunk['sport'].astype(str).str.lower().str.strip()
+
+        for sport, filename in sport_files.items():
+            sport_df = chunk[chunk['sport'] == sport]
+            if sport_df.empty:
+                continue
+
+            sport_df.to_csv(
+                filename,
+                mode='a',
+                header=not file_written[sport],
+                index=False
+            )
+            file_written[sport] = True
+            counts[sport] += len(sport_df)
+
     for sport, filename in sport_files.items():
-        sport_df = df[df['sport'] == sport]
-        count = len(sport_df)
-        
+        count = counts[sport]
         if count > 0:
-            sport_df.to_csv(filename, index=False)
             print(f"  {sport.upper()}: {count:,} trades -> {filename}")
             logger.info(f"Saved {count} {sport.upper()} trades to {filename}")
         else:
@@ -1400,6 +1605,20 @@ if __name__ == "__main__":
             default=None,
             help="Limit users per market (for testing)"
         )
+        parser.add_argument(
+            "--sport",
+            type=str,
+            default="all",
+            choices=["all", "nfl", "nba", "cfb", "cbb"],
+            help="Filter by sport (all, nfl, nba, cfb, cbb)"
+        )
+        parser.add_argument(
+            "--pick-basis",
+            type=str,
+            default=DEFAULT_PICK_BASIS,
+            choices=["total_bought", "amount"],
+            help="How to classify user picks (total_bought or amount)"
+        )
 
         args = parser.parse_args()
 
@@ -1419,7 +1638,9 @@ if __name__ == "__main__":
                 verbose=args.verbose,
                 max_users_per_market=args.max_users,
                 force_reprocess=args.force_reprocess,
-                market_filter=market_filter
+                market_filter=market_filter,
+                sport_filter=args.sport,
+                pick_basis=args.pick_basis,
             )
         except Exception as e:
             print(f"\nError: {e}")
