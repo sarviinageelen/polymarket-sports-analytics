@@ -2,13 +2,22 @@
 Interactive menu utilities for Polymarket Sports Analytics.
 
 This module contains reusable menu functions for sport selection,
-time period selection, and other interactive prompts.
+season selection, time period selection, and other interactive prompts.
 """
 
 import os
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
-from utils.shared_utils import SPORTS_CONFIG, get_current_week, get_last_n_weeks
+from utils.shared_utils import (
+    SPORTS_CONFIG,
+    get_current_week,
+    get_last_n_weeks,
+    get_season,
+    get_season_week_limit,
+    get_seasons,
+    get_week_dates,
+)
 
 
 # =============================================================================
@@ -63,12 +72,10 @@ def select_sport(
         return "exit"
 
     sport = sport_map.get(choice)
-
     if not sport:
         print("Invalid choice")
         return None
 
-    # Check if input file exists (for picks/analysis generators)
     if check_csv and sport != "all":
         config = SPORTS_CONFIG[sport]
         if not os.path.exists(config["input_csv"]):
@@ -80,65 +87,143 @@ def select_sport(
 
 
 # =============================================================================
-# Time Period Selection
+# Season Selection
 # =============================================================================
 
-def select_time_period(sport: str) -> Tuple[Optional[List[int]], bool]:
+def select_season(sport: str) -> Optional[str]:
     """
-    Display time period selection menu and return (weeks, is_season).
+    Display season selection menu and return season_id.
 
     Args:
         sport: Sport key (NFL, NBA, CFB, CBB)
 
     Returns:
-        Tuple of (weeks list, is_season flag).
-        Returns (None, False) for exit or invalid choice.
+        season_id string, "exit", or None for invalid selection.
     """
-    config = SPORTS_CONFIG[sport]
-    season_year = config["season_year"]
+    seasons = get_seasons(sport)
+    if not seasons:
+        print(f"No seasons configured for {sport}.")
+        return None
 
-    current = get_current_week(sport)
     print()
-    print(f"{sport} {season_year} Season")
-    print(f"   Current Week: {current}")
-    print()
-
-    # Build menu options
-    last5 = get_last_n_weeks(5, sport)
-
-    print("Select time period:")
-    print(f"  1. Latest week (Week {current})")
-    if current > 1:
-        print(f"  2. Previous week (Week {current - 1})")
-    if last5:
-        print(f"  3. Last 5 weeks (Weeks {min(last5)}-{max(last5)})")
-    print(f"  4. Whole season")
+    print(f"Select season ({sport}):")
+    for idx, season in enumerate(seasons, start=1):
+        default_tag = " [default]" if season.get("default") else ""
+        start_str = season["start_date"].strftime("%Y-%m-%d")
+        end_str = season["end_date"].strftime("%Y-%m-%d")
+        regular_weeks = season["regular_weeks"]
+        print(
+            f"  {idx}. {season['label']} "
+            f"(Start: {start_str}, Regular: {regular_weeks}w, End: {end_str}){default_tag}"
+        )
     print("  0. Exit")
     print()
 
-    choice = input("Enter choice (0-4): ").strip()
+    choice = input(f"Enter choice (0-{len(seasons)}): ").strip()
+    if choice == "0":
+        print("Exiting.")
+        return "exit"
 
+    if not choice.isdigit():
+        print("Invalid choice")
+        return None
+
+    index = int(choice) - 1
+    if index < 0 or index >= len(seasons):
+        print("Invalid choice")
+        return None
+
+    return seasons[index]["season_id"]
+
+
+# =============================================================================
+# Time Period Selection
+# =============================================================================
+
+def _format_week_span(week: int, sport: str, season_id: str) -> Tuple[str, str]:
+    """Return week span as inclusive date strings."""
+    start_str, end_exclusive_str = get_week_dates(week, sport, season_id)
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_exclusive_str, "%Y-%m-%d") - timedelta(days=1)
+    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
+
+def select_time_period(sport: str, season_id: str) -> Tuple[Optional[List[int]], bool]:
+    """
+    Display time period selection menu and return (weeks, is_season).
+
+    Args:
+        sport: Sport key (NFL, NBA, CFB, CBB)
+        season_id: Season identifier
+
+    Returns:
+        Tuple of (weeks list, is_season flag).
+        Returns (None, False) for exit or invalid choice.
+    """
+    season = get_season(sport, season_id)
+    current = get_current_week(sport, season_id, include_postseason=True)
+    total_weeks = get_season_week_limit(sport, season_id, include_postseason=True)
+    season_start = season["start_date"].strftime("%Y-%m-%d")
+    season_end = season["end_date"].strftime("%Y-%m-%d")
+
+    print()
+    print(f"{sport} {season['label']} Season (Postseason Included)")
+    print(f"   Current Week: {current} of {total_weeks}")
+    print(f"   Season Window: {season_start} to {season_end}")
+    print()
+
+    options = {}
+    option_idx = 1
+
+    print("Select time period:")
+    if current >= 1:
+        start, end = _format_week_span(current, sport, season_id)
+        print(f"  {option_idx}. Latest week (Week {current}: {start} to {end})")
+        options[str(option_idx)] = ([current], False)
+        option_idx += 1
+
+        if current > 1:
+            prev_week = current - 1
+            start, end = _format_week_span(prev_week, sport, season_id)
+            print(f"  {option_idx}. Previous week (Week {prev_week}: {start} to {end})")
+            options[str(option_idx)] = ([prev_week], False)
+            option_idx += 1
+
+        last5 = get_last_n_weeks(5, sport, season_id, include_postseason=True)
+        if last5:
+            start, _ = _format_week_span(min(last5), sport, season_id)
+            _, end = _format_week_span(max(last5), sport, season_id)
+            print(
+                f"  {option_idx}. Last 5 weeks "
+                f"(Weeks {min(last5)}-{max(last5)}: {start} to {end})"
+            )
+            options[str(option_idx)] = (last5, False)
+            option_idx += 1
+    else:
+        print("   (Season has not started yet based on current date.)")
+
+    print(f"  {option_idx}. Whole season (Weeks 1-{total_weeks})")
+    options[str(option_idx)] = (None, True)
+    print("  0. Exit")
+    print()
+
+    choice = input(f"Enter choice (0-{option_idx}): ").strip()
     if choice == "0":
         print("Exiting.")
         return None, False
 
-    if choice == "1":
-        weeks = [current]
-        print(f"\nGenerating {sport} Week {current} leaderboard...")
-    elif choice == "2" and current > 1:
-        weeks = [current - 1]
-        print(f"\nGenerating {sport} Week {current - 1} leaderboard...")
-    elif choice == "3" and last5:
-        weeks = last5
-        print(f"\nGenerating {sport} Weeks {min(last5)}-{max(last5)} leaderboard...")
-    elif choice == "4":
-        weeks = None
-        print(f"\nGenerating {sport} Full Season leaderboard...")
-    else:
+    if choice not in options:
         print("Invalid choice")
         return None, False
 
-    return weeks, (weeks is None)
+    weeks, is_season = options[choice]
+    if is_season:
+        print(f"\nGenerating {sport} {season['label']} Full Season report...")
+    else:
+        week_range = f"{min(weeks)}-{max(weeks)}" if len(weeks) > 1 else str(weeks[0])
+        print(f"\nGenerating {sport} {season['label']} Week(s) {week_range} report...")
+
+    return weeks, is_season
 
 
 # =============================================================================

@@ -13,6 +13,7 @@ from utils.shared_utils import (
     get_week_dates,
     get_output_filename,
     filter_by_weeks,
+    get_seasons,
     SPORTS_CONFIG,
 )
 
@@ -57,24 +58,24 @@ class TestGetWeekDates:
     """Test get_week_dates function."""
 
     def test_nfl_week_1(self):
-        start, end = get_week_dates(1, "NFL")
+        start, end = get_week_dates(1, "NFL", "2025")
         # NFL 2025 season starts Thu Sep 4, Week 1 is Sep 4-11
         assert start == "2025-09-04"
         assert end == "2025-09-11"
 
     def test_nfl_week_2(self):
-        start, end = get_week_dates(2, "NFL")
+        start, end = get_week_dates(2, "NFL", "2025")
         # Week 2 is Sep 11-18
         assert start == "2025-09-11"
         assert end == "2025-09-18"
 
     def test_invalid_week_zero(self):
         with pytest.raises(ValueError):
-            get_week_dates(0, "NFL")
+            get_week_dates(0, "NFL", "2025")
 
     def test_invalid_week_negative(self):
         with pytest.raises(ValueError):
-            get_week_dates(-1, "NFL")
+            get_week_dates(-1, "NFL", "2025")
 
 
 class TestGetOutputFilename:
@@ -221,7 +222,7 @@ class TestFilterByWeeks:
         })
 
         # Filter to week 1 only (Sep 3-10 for NFL)
-        result = filter_by_weeks(df, [1], "NFL")
+        result = filter_by_weeks(df, [1], "NFL", "2025")
 
         assert len(result) == 1
         assert result["user_address"].iloc[0] == "0x1"
@@ -233,7 +234,7 @@ class TestFilterByWeeks:
         })
 
         # Filter to weeks 1-2 (Sep 3-17 for NFL)
-        result = filter_by_weeks(df, [1, 2], "NFL")
+        result = filter_by_weeks(df, [1, 2], "NFL", "2025")
 
         assert len(result) == 2
 
@@ -243,7 +244,7 @@ class TestFilterByWeeks:
             "user_address": ["0x1"],
         })
 
-        result = filter_by_weeks(df, [], "NFL")
+        result = filter_by_weeks(df, [], "NFL", "2025")
 
         assert len(result) == 1
 
@@ -260,6 +261,18 @@ class TestSportsConfig:
     def test_required_fields(self):
         for sport, config in SPORTS_CONFIG.items():
             assert "input_csv" in config, f"{sport} missing input_csv"
-            assert "season_start" in config, f"{sport} missing season_start"
-            assert "total_weeks" in config, f"{sport} missing total_weeks"
-            assert "season_year" in config, f"{sport} missing season_year"
+            assert "seasons" in config, f"{sport} missing seasons"
+            assert isinstance(config["seasons"], list), f"{sport} seasons must be a list"
+            assert len(config["seasons"]) > 0, f"{sport} has no season entries"
+
+            for season in config["seasons"]:
+                assert "season_id" in season, f"{sport} season missing season_id"
+                assert "label" in season, f"{sport} season missing label"
+                assert "start_date" in season, f"{sport} season missing start_date"
+                assert "regular_weeks" in season, f"{sport} season missing regular_weeks"
+                assert "end_date" in season, f"{sport} season missing end_date"
+
+    def test_get_seasons_returns_sorted(self):
+        seasons = get_seasons("NFL")
+        assert len(seasons) >= 1
+        assert seasons[0]["start_date"] >= seasons[-1]["start_date"]

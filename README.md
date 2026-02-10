@@ -141,12 +141,16 @@ Options:
 ```bash
 python update_picks.py
 ```
-Runs an interactive menu to choose sport and time window (latest week, previous week, last 5 weeks, full season). Generates a leaderboard-style Excel with a pick-by-pick grid.
+Runs an interactive menu to choose sport, then season, then time window.
+Time window options are postseason-inclusive and include explicit date ranges
+(latest week, previous week, last 5 weeks, full season).
+Generates a leaderboard-style Excel with a pick-by-pick grid.
+Terminal output is concise and milestone-based (no terminal preview table).
 
 CLI mode:
 ```bash
-python update_picks.py --sport NFL --weeks 5
-python update_picks.py --sport NBA --last5
+python update_picks.py --sport NFL --season-id 2025 --weeks 5
+python update_picks.py --sport NBA --season-id 2025-26 --last5
 python update_picks.py --sport all --season
 ```
 
@@ -155,18 +159,22 @@ python update_picks.py --sport all --season
 ```bash
 python update_analyze.py
 ```
-Runs an interactive menu to choose sport and time window. Generates a flat-table Excel analysis with one row per user per game, including entry prices, consensus percentages, and pick results.
+Runs an interactive menu to choose sport, then season, then time window.
+Time window options are postseason-inclusive and include explicit date ranges.
+Generates a flat-table Excel analysis with one row per user per game,
+including entry prices, consensus percentages, and pick results.
+Terminal output is concise and milestone-based (no terminal preview table).
 
 CLI mode:
 ```bash
-python update_analyze.py --sport CFB --weeks 3-5
+python update_analyze.py --sport CFB --season-id 2025 --weeks 3-5
 python update_analyze.py --sport all --season
 ```
 
 ### Example Workflows
 
 **Generate NBA leaderboard for the last 5 weeks:**
-Run `python update_picks.py`, select NBA, then choose "Last 5 weeks".
+Run `python update_picks.py`, select NBA, select season, then choose "Last 5 weeks".
 
 **Refresh only active markets:**
 ```bash

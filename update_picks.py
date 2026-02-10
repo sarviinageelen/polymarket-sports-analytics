@@ -20,8 +20,10 @@ from utils.shared_utils import (
     normalize_is_correct,
     coerce_numeric_series,
     parse_game_teams,
+    get_season,
     get_current_week,
     get_last_n_weeks,
+    filter_by_season,
     filter_by_weeks,
     get_output_filename,
 )
@@ -33,7 +35,9 @@ from utils.excel_utils import (
     HEADER_FONT,
     format_time,
 )
-from utils.menu_utils import select_sport, select_time_period
+from utils.menu_utils import select_sport, select_season, select_time_period
+
+WRITE_PROGRESS_THRESHOLD = 2000
 
 
 # =============================================================================
@@ -56,9 +60,8 @@ def load_and_transform(
         - game_start_time -> game_date (extract date)
         - is_correct_pick -> result (TRUE->won, FALSE->lost, empty->pending)
     """
-    print(f"Loading {input_csv}...")
     df = pd.read_csv(input_csv)
-    print(f"   Loaded {len(df):,} rows")
+    print(f"Load: {input_csv} ({len(df):,} rows)")
 
     # Validate required columns exist
     required_cols = ['is_correct_pick', 'game_start_time', 'match_title',
@@ -66,8 +69,6 @@ def load_and_transform(
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns in CSV: {missing}")
-
-    print("Transforming data...")
 
     # Extract game_date from game_start_time (just take first 10 chars: YYYY-MM-DD)
     df['game_date'] = df['game_start_time'].str[:10]
@@ -79,14 +80,6 @@ def load_and_transform(
     normalized_is_correct = df['is_correct_pick'].apply(normalize_is_correct)
     df['is_correct_pick'] = normalized_is_correct
     df['result'] = normalized_is_correct.map({True: 'won', False: 'lost'}).fillna('pending')
-
-    print(f"   Transformed {len(df):,} rows")
-
-    # ==========================================================================
-    # Filter out late picks (price >= 0.95)
-    # These are bets placed when games are nearly decided
-    # ==========================================================================
-    print("Filtering late picks...")
 
     # Coerce price columns to numeric (remove commas if present)
     df['yes_avg_price'] = coerce_numeric_series(df['yes_avg_price'])
@@ -109,13 +102,9 @@ def load_and_transform(
     original_picks = len(df)
     df = df[df['pick_price'] < late_pick_threshold]
     excluded_picks = original_picks - len(df)
-    print(f"   Excluded {excluded_picks:,} late picks (price >= {late_pick_threshold})")
-    print(f"   Remaining: {len(df):,} picks")
 
-    # ==========================================================================
     # Filter users by win rate (>= 70% with minimum 5 games)
-    # ==========================================================================
-    print("Filtering by win rate...")
+    users_before_filters = df['user_address'].nunique()
     user_stats = df.groupby('user_address').agg(
         total_games=('result', lambda x: x.isin(['won', 'lost']).sum()),
         wins=('result', lambda x: (x == 'won').sum())
@@ -131,33 +120,29 @@ def load_and_transform(
 
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(qualified_users)]
-    excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< {min_win_pct}% win rate with {min_games_for_win_pct}+ games)")
-    print(f"   Remaining: {df['user_address'].nunique():,} users")
+    excluded_win_rate_users = original_users - df['user_address'].nunique()
 
-    # ==========================================================================
     # Filter users by minimum games (>= 3 games)
-    # ==========================================================================
-    print("Filtering by minimum games...")
     user_game_counts = df.groupby('user_address').size()
     users_with_min_games = user_game_counts[user_game_counts >= min_games].index
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(users_with_min_games)]
-    excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< {min_games} games)")
-    print(f"   Remaining: {df['user_address'].nunique():,} users")
+    excluded_min_games_users = original_users - df['user_address'].nunique()
 
-    # ==========================================================================
     # Filter users by minimum wins (>= 3 wins)
-    # ==========================================================================
-    print("Filtering by minimum wins...")
     user_wins = df[df['result'] == 'won'].groupby('user_address').size()
     users_with_min_wins = user_wins[user_wins >= min_wins].index
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(users_with_min_wins)]
-    excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< {min_wins} wins)")
-    print(f"   Remaining: {df['user_address'].nunique():,} users")
+    excluded_min_wins_users = original_users - df['user_address'].nunique()
+    final_users = df['user_address'].nunique()
+
+    print(
+        "Filter: "
+        f"picks {original_picks:,}->{len(df):,} (late removed {excluded_picks:,}); "
+        f"users {users_before_filters:,}->{final_users:,} "
+        f"(win-rate {excluded_win_rate_users:,}, min-games {excluded_min_games_users:,}, min-wins {excluded_min_wins_users:,})"
+    )
 
     # Detect duplicate picks (same user, same game)
     duplicates = df.groupby(['user_address', 'game']).size()
@@ -185,16 +170,8 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     sort_col = "game_start_time" if "game_start_time" in df.columns else "game_date"
     games_df = df[["game", sort_col]].drop_duplicates().sort_values(sort_col)
     games = games_df["game"].tolist()
-    print(f"   Found {len(games)} games")
-
     # Get unique users
     total_users = df["user_address"].nunique()
-    print(f"   Found {total_users:,} users")
-
-    # ==========================================================================
-    # OPTIMIZED: Vectorized stats calculation
-    # ==========================================================================
-    print("Computing stats (vectorized)...")
 
     # Group by user and compute stats in one pass
     stats_df = df.groupby("user_address").agg(
@@ -230,13 +207,6 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
 
         stats_df = stats_df.merge(pnl_stats, on="user_address", how="left")
 
-    print(f"   Stats computed in {format_time(time.time() - start_time)}")
-
-    # ==========================================================================
-    # OPTIMIZED: Vectorized streak calculation
-    # ==========================================================================
-    print("Computing streaks...")
-    streak_time = time.time()
 
     # Filter to resolved games only for streak calculation (exclude pending)
     df_resolved = df[df['result'].isin(['won', 'lost'])].copy()
@@ -277,13 +247,6 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     stats_df["win_streak"] = stats_df["win_streak"].fillna(0).astype(int)
     stats_df["loss_streak"] = stats_df["loss_streak"].fillna(0).astype(int)
 
-    print(f"   Streaks computed in {format_time(time.time() - streak_time)}")
-
-    # ==========================================================================
-    # Calculate Last 10 Games Win Rate (recent form across whole dataset)
-    # ==========================================================================
-    print("Computing last 10 form...")
-    last10_time = time.time()
 
     # Only consider resolved games for last 10 calculation
     resolved_df = df[df['result'].isin(['won', 'lost'])].copy()
@@ -310,13 +273,6 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
         stats_df['last_10_wins'] = 0
         stats_df['last_10_games'] = 0
 
-    print(f"   Last 10 computed in {format_time(time.time() - last10_time)}")
-
-    # ==========================================================================
-    # Consensus Fade Metrics (majority vs contrarian performance)
-    # ==========================================================================
-    print("Computing consensus fade...")
-    consensus_fade_time = time.time()
 
     if not df.empty:
         # Determine majority pick per game
@@ -343,18 +299,11 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
 
         stats_df = stats_df.merge(contrarian_stats, on="user_address", how="left")
 
-    print(f"   Consensus fade computed in {format_time(time.time() - consensus_fade_time)}")
 
     # Ensure optional columns exist for consistent output
     for col in ["roi_pct", "total_pnl", "contrarian_win_pct", "contrarian_games"]:
         if col not in stats_df.columns:
             stats_df[col] = None
-
-    # ==========================================================================
-    # OPTIMIZED: Vectorized pivot for picks
-    # ==========================================================================
-    print("Pivoting picks...")
-    pivot_time = time.time()
 
     # Pivot picks
     picks_pivot = df.pivot_table(
@@ -377,14 +326,6 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
 
     # Combine pivots
     pivot_df = picks_pivot.join(results_pivot).reset_index()
-
-    print(f"   Pivot completed in {format_time(time.time() - pivot_time)}")
-
-    # ==========================================================================
-    # Calculate consensus percentages per game (team names only, formulas will calculate %)
-    # ==========================================================================
-    print("Computing consensus...")
-    consensus_time = time.time()
 
     # Build consensus data for each game (team names and date extracted separately)
     game_consensus = {}
@@ -411,14 +352,6 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
             'game_date': game_date,
         }
 
-    print(f"   Consensus computed in {format_time(time.time() - consensus_time)}")
-
-    # ==========================================================================
-    # Merge everything
-    # ==========================================================================
-    print("Merging data...")
-    merge_time = time.time()
-
     result_df = stats_df.merge(pivot_df, on="user_address", how="left")
 
     # Sort by wins desc, win_pct desc, loss_streak asc
@@ -433,14 +366,8 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     # Fill NaN with empty string for display
     result_df = result_df.fillna("")
 
-    print(f"   Merge completed in {format_time(time.time() - merge_time)}")
-    print(f"Created {len(result_df):,} user rows (total: {format_time(time.time() - start_time)})")
-
-    # ==========================================================================
-    # Write Excel (normal mode for freeze pane support)
-    # ==========================================================================
-    print(f"Writing Excel...")
-    excel_time = time.time()
+    print(f"Build leaderboard: {len(result_df):,} users, {len(games):,} games")
+    print(f"Write workbook: {output_file}")
 
     wb = Workbook()
     ws = wb.active
@@ -589,8 +516,9 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
     games_set = set(games)
 
     # Write data rows (starting at row 7)
+    show_progress = total_rows >= WRITE_PROGRESS_THRESHOLD
     for row_idx in range(total_rows):
-        if (row_idx + 1) % 10000 == 0:
+        if show_progress and (row_idx + 1) % 10000 == 0:
             pct = ((row_idx + 1) / total_rows) * 100
             print(f"   Writing row {row_idx + 1:,}/{total_rows:,} ({pct:.1f}%)", end="\r")
 
@@ -625,8 +553,8 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
                 elif result == "pending":
                     cell.fill = YELLOW_FILL
 
-    print(f"   Writing row {total_rows:,}/{total_rows:,} (100.0%)")
-    print(f"   Excel rows written in {format_time(time.time() - excel_time)}")
+    if show_progress:
+        print(f"   Writing row {total_rows:,}/{total_rows:,} (100.0%)")
 
     # Add freeze pane after stats columns and header rows
     freeze_col = get_column_letter(num_stats_cols + 1)
@@ -658,34 +586,10 @@ def generate_excel(df: pd.DataFrame, output_file: str, title: str):
         ws.column_dimensions[col_letter].width = 10
 
     # Save
-    print("Saving file...")
-    save_time = time.time()
     wb.save(output_file)
-    print(f"   File saved in {format_time(time.time() - save_time)}")
-
-    # Print preview
-    print("\n" + "="*80)
-    print("PREVIEW (Top 10)")
-    print("="*80)
-    preview_cols = [
-        "rank",
-        "user_address",
-        "games",
-        "wins",
-        "losses",
-        "win_pct",
-        "roi_pct",
-        "contrarian_win_pct",
-        "last_10",
-    ]
-    preview_df = result_df[preview_cols].head(10).copy()
-    preview_df["user_address"] = preview_df["user_address"].apply(lambda x: x[:18] + "..." if len(str(x)) > 20 else x)
-    preview_df.columns = ["rank", "user_address", "games", "wins", "losses", "win %", "roi %", "contrarian win %", "last 10"]
-    print(preview_df.to_string(index=False))
 
     total_time = time.time() - start_time
-    print(f"\nSaved: {output_file}")
-    print(f"Total time: {format_time(total_time)}")
+    print(f"Done: {len(result_df):,} users, {total_rows:,} workbook rows -> {output_file} ({format_time(total_time)})")
 
 
 # =============================================================================
@@ -696,6 +600,7 @@ def do_generate(
     sport: str,
     weeks: Optional[List[int]] = None,
     is_season: bool = False,
+    season_id: Optional[str] = None,
     late_pick_threshold: float = LATE_PICK_THRESHOLD,
     min_win_pct: float = MIN_WIN_PCT,
     min_games_for_win_pct: int = MIN_GAMES_FOR_WIN_PCT,
@@ -705,11 +610,13 @@ def do_generate(
     """Main generation function."""
     if sport.lower() == "all":
         input_csv = "db_trades.csv"
-        season_year = datetime.now().year
+        season_label = str(datetime.now().year)
     else:
         config = SPORTS_CONFIG[sport]
         input_csv = config["input_csv"]
-        season_year = config["season_year"]
+        season = get_season(sport, season_id)
+        season_id = season["season_id"]
+        season_label = season["label"]
 
     # Check if input file exists
     if not os.path.exists(input_csv):
@@ -726,22 +633,37 @@ def do_generate(
         min_wins=min_wins,
     )
 
+    # Always constrain single-sport reports to the selected season window
+    if sport.lower() != "all":
+        print(f"Filtering to {sport} {season_label} season window...")
+        df = filter_by_season(df, sport, season_id)
+        print(f"   Filtered to {len(df):,} rows")
+
     # Filter by weeks if specified
     if weeks and not is_season and sport.lower() != "all":
         week_range = f"{min(weeks)}-{max(weeks)}" if len(weeks) > 1 else str(weeks[0])
         print(f"Filtering to Week(s) {week_range}...")
-        df = filter_by_weeks(df, weeks, sport)
+        df = filter_by_weeks(df, weeks, sport, season_id)
         print(f"   Filtered to {len(df):,} rows")
-        title = f"{sport} Weeks {week_range}"
+        title = f"{sport} {season_label} Weeks {week_range} (Postseason Included)"
     else:
-        title = f"{sport} Season {season_year}"
+        if sport.lower() == "all":
+            title = f"ALL Sports Season {season_label}"
+        else:
+            title = f"{sport} {season_label} Season (Postseason Included)"
 
     if df.empty:
         print("No data matches the filter criteria")
         return
 
     # Generate output filename
-    output_file = get_output_filename(weeks, is_season, sport, prefix="leaderboard")
+    output_file = get_output_filename(
+        weeks,
+        is_season,
+        sport,
+        prefix="leaderboard",
+        season_id=season_id,
+    )
 
     # Generate Excel
     generate_excel(df, output_file, title)
@@ -761,6 +683,7 @@ def main():
             help="Sport: NFL, NBA, CFB, CBB, or all",
         )
         parser.add_argument("--weeks", type=str, help="Weeks list (e.g., 5 or 3-5 or 1,2,3)")
+        parser.add_argument("--season-id", type=str, help="Season ID (e.g., 2025, 2025-26)")
         parser.add_argument("--season", action="store_true", help="Full season")
         parser.add_argument("--latest", action="store_true", help="Latest week")
         parser.add_argument("--previous", action="store_true", help="Previous week")
@@ -775,6 +698,17 @@ def main():
 
         sport_arg = args.sport.strip().lower()
         sport = "all" if sport_arg == "all" else sport_arg.upper()
+        selected_season_id = None
+
+        if sport != "all":
+            try:
+                selected_season = get_season(sport, args.season_id)
+                selected_season_id = selected_season["season_id"]
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
+        elif args.season_id:
+            print("Warning: --season-id is ignored when --sport all")
 
         def parse_weeks_arg(value: str) -> List[int]:
             value = value.strip()
@@ -798,13 +732,26 @@ def main():
                 weeks = None
                 is_season = True
             else:
-                current_week = get_current_week(sport)
+                current_week = get_current_week(sport, selected_season_id, include_postseason=True)
                 if args.latest:
-                    weeks = [current_week]
+                    if current_week == 0:
+                        print("Season has not started yet. Generating full season.")
+                        weeks = None
+                    else:
+                        weeks = [current_week]
                 elif args.previous:
-                    weeks = [max(current_week - 1, 1)]
+                    if current_week <= 1:
+                        print("Previous week is not available. Generating latest available week.")
+                        weeks = [current_week] if current_week > 0 else None
+                    else:
+                        weeks = [current_week - 1]
                 elif args.last5:
-                    weeks = get_last_n_weeks(5, sport)
+                    weeks = get_last_n_weeks(
+                        5, sport, selected_season_id, include_postseason=True
+                    )
+                    if not weeks:
+                        print("No active week found yet. Generating full season.")
+                        weeks = None
                 elif args.weeks:
                     weeks = parse_weeks_arg(args.weeks)
                 is_season = weeks is None
@@ -813,6 +760,7 @@ def main():
             sport=sport,
             weeks=weeks,
             is_season=is_season,
+            season_id=selected_season_id,
             late_pick_threshold=args.late_pick_threshold,
             min_win_pct=args.min_win_pct,
             min_games_for_win_pct=args.min_games_win_pct,
@@ -830,11 +778,15 @@ def main():
         do_generate(sport=sport, weeks=None, is_season=True)
         return
 
-    weeks, is_season = select_time_period(sport)
+    season_id = select_season(sport)
+    if not season_id or season_id == "exit":
+        return
+
+    weeks, is_season = select_time_period(sport, season_id)
     if weeks is None and not is_season:
         return
 
-    do_generate(sport=sport, weeks=weeks, is_season=is_season)
+    do_generate(sport=sport, weeks=weeks, is_season=is_season, season_id=season_id)
 
 
 if __name__ == "__main__":

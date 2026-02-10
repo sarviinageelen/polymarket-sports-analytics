@@ -20,8 +20,10 @@ from utils.shared_utils import (
     normalize_is_correct,
     coerce_numeric_series,
     parse_game_teams,
+    get_season,
     get_current_week,
     get_last_n_weeks,
+    filter_by_season,
     filter_by_weeks,
     get_output_filename,
 )
@@ -33,7 +35,9 @@ from utils.excel_utils import (
     HEADER_FONT,
     format_time,
 )
-from utils.menu_utils import select_sport, select_time_period
+from utils.menu_utils import select_sport, select_season, select_time_period
+
+WRITE_PROGRESS_THRESHOLD = 2000
 
 
 # =============================================================================
@@ -53,11 +57,8 @@ def load_and_transform(
 
     Similar to update_picks.py but with additional filters for min games/wins.
     """
-    print(f"Loading {input_csv}...")
     df = pd.read_csv(input_csv)
-    print(f"   Loaded {len(df):,} rows")
-
-    print("Transforming data...")
+    print(f"Load: {input_csv} ({len(df):,} rows)")
 
     # Extract game_date from game_start_time
     df['game_date'] = df['game_start_time'].str[:10]
@@ -69,11 +70,6 @@ def load_and_transform(
     normalized = df['is_correct_pick'].apply(normalize_is_correct)
     df['is_correct_pick'] = normalized
     df['result'] = normalized.map({True: 'won', False: 'lost'}).fillna('pending')
-
-    print(f"   Transformed {len(df):,} rows")
-
-    # Filter out late picks (price >= 0.95)
-    print("Filtering late picks...")
 
     # Coerce price columns to numeric (remove commas if present)
     df['yes_avg_price'] = coerce_numeric_series(df.get('yes_avg_price'))
@@ -93,11 +89,9 @@ def load_and_transform(
     original_picks = len(df)
     df = df[df['pick_price'] < late_pick_threshold]
     excluded_picks = original_picks - len(df)
-    print(f"   Excluded {excluded_picks:,} late picks (price >= {late_pick_threshold})")
-    print(f"   Remaining: {len(df):,} picks")
 
     # Filter users by win rate (>= 70% with minimum 5 games)
-    print("Filtering by win rate...")
+    users_before_filters = df['user_address'].nunique()
     user_stats = df.groupby('user_address').agg(
         total_games=('result', lambda x: x.isin(['won', 'lost']).sum()),
         wins=('result', lambda x: (x == 'won').sum())
@@ -112,29 +106,29 @@ def load_and_transform(
 
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(qualified_users)]
-    excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< {min_win_pct}% win rate with {min_games_for_win_pct}+ games)")
-    print(f"   Remaining: {df['user_address'].nunique():,} users")
+    excluded_win_rate_users = original_users - df['user_address'].nunique()
 
     # Filter users by minimum games
-    print("Filtering by minimum games...")
     user_game_counts = df.groupby('user_address').size()
     users_with_min_games = user_game_counts[user_game_counts >= min_games].index
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(users_with_min_games)]
-    excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< {min_games} games)")
-    print(f"   Remaining: {df['user_address'].nunique():,} users")
+    excluded_min_games_users = original_users - df['user_address'].nunique()
 
     # Filter users by minimum wins
-    print("Filtering by minimum wins...")
     user_wins = df[df['result'] == 'won'].groupby('user_address').size()
     users_with_min_wins = user_wins[user_wins >= min_wins].index
     original_users = df['user_address'].nunique()
     df = df[df['user_address'].isin(users_with_min_wins)]
-    excluded_users = original_users - df['user_address'].nunique()
-    print(f"   Excluded {excluded_users:,} users (< {min_wins} wins)")
-    print(f"   Remaining: {df['user_address'].nunique():,} users")
+    excluded_min_wins_users = original_users - df['user_address'].nunique()
+    final_users = df['user_address'].nunique()
+
+    print(
+        "Filter: "
+        f"picks {original_picks:,}->{len(df):,} (late removed {excluded_picks:,}); "
+        f"users {users_before_filters:,}->{final_users:,} "
+        f"(win-rate {excluded_win_rate_users:,}, min-games {excluded_min_games_users:,}, min-wins {excluded_min_wins_users:,})"
+    )
 
     return df
 
@@ -145,8 +139,6 @@ def load_and_transform(
 
 def calculate_user_stats(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate per-user statistics."""
-    print("Computing user stats...")
-
     # Basic stats
     stats_df = df.groupby("user_address").agg(
         games=("result", "count"),
@@ -231,14 +223,11 @@ def calculate_user_stats(df: pd.DataFrame) -> pd.DataFrame:
         ascending=[False, False, False]
     ).reset_index(drop=True)
 
-    print(f"   Computed stats for {len(stats_df):,} users")
     return stats_df
 
 
 def calculate_consensus(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate consensus percentages per game."""
-    print("Computing consensus...")
-
     consensus_data = []
 
     for game_name in df['game'].unique():
@@ -291,7 +280,6 @@ def calculate_consensus(df: pd.DataFrame) -> pd.DataFrame:
         })
 
     consensus_df = pd.DataFrame(consensus_data)
-    print(f"   Computed consensus for {len(consensus_df):,} games")
     return consensus_df
 
 
@@ -301,8 +289,6 @@ def calculate_consensus(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_flat_table(df: pd.DataFrame, user_stats: pd.DataFrame, consensus: pd.DataFrame) -> pd.DataFrame:
     """Build the flat table with one row per pick."""
-    print("Building flat table...")
-
     # Start with picks dataframe
     flat_df = df[['user_address', 'game', 'game_date', 'user_pick', 'result', 'pick_price']].copy()
     flat_df = flat_df.rename(columns={'user_pick': 'pick'})
@@ -351,7 +337,6 @@ def build_flat_table(df: pd.DataFrame, user_stats: pd.DataFrame, consensus: pd.D
     # Sort by win_pct desc, then game_date
     flat_df = flat_df.sort_values(['win_pct', 'game_date'], ascending=[False, True]).reset_index(drop=True)
 
-    print(f"   Built flat table with {len(flat_df):,} rows")
     return flat_df
 
 
@@ -399,7 +384,7 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str, mar
         return
 
     start_time = time.time()
-    print(f"Generating Excel: {output_file}")
+    print(f"Write workbook: {output_file}")
 
     wb = Workbook()
     ws = wb.active
@@ -439,8 +424,9 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str, mar
 
     # Write data rows
     total_rows = len(flat_df)
+    show_progress = total_rows >= WRITE_PROGRESS_THRESHOLD
     for row_idx, row in flat_df.iterrows():
-        if (row_idx + 1) % 5000 == 0:
+        if show_progress and (row_idx + 1) % 5000 == 0:
             pct = ((row_idx + 1) / total_rows) * 100
             print(f"   Writing row {row_idx + 1:,}/{total_rows:,} ({pct:.1f}%)", end="\r")
 
@@ -497,7 +483,8 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str, mar
                 elif result == "pending":
                     cell.fill = YELLOW_FILL
 
-    print(f"   Writing row {total_rows:,}/{total_rows:,} (100.0%)")
+    if show_progress:
+        print(f"   Writing row {total_rows:,}/{total_rows:,} (100.0%)")
 
     # Freeze panes after user stats (after last_10)
     ws.freeze_panes = "J2"
@@ -587,24 +574,10 @@ def generate_excel_flat(flat_df: pd.DataFrame, output_file: str, title: str, mar
         ws2.freeze_panes = "A2"
 
     # Save
-    print("Saving file...")
-    save_time = time.time()
     wb.save(output_file)
-    print(f"   File saved in {format_time(time.time() - save_time)}")
-
-    # Preview
-    print("\n" + "=" * 80)
-    print("PREVIEW (First 10 rows)")
-    print("=" * 80)
-    preview_cols = ['user_address', 'win_pct', 'roi_pct', 'game', 'pick', 'result', 'pick_pct']
-    preview_df = flat_df[preview_cols].head(10).copy()
-    preview_df['user_address'] = preview_df['user_address'].apply(lambda x: x[:12] + "..." if len(str(x)) > 15 else x)
-    preview_df['game'] = preview_df['game'].apply(lambda x: x[:20] + "..." if len(str(x)) > 23 else x)
-    print(preview_df.to_string(index=False))
 
     total_time = time.time() - start_time
-    print(f"\nSaved: {output_file}")
-    print(f"Total time: {format_time(total_time)}")
+    print(f"Done: {len(flat_df):,} rows -> {output_file} ({format_time(total_time)})")
 
 
 # =============================================================================
@@ -615,6 +588,7 @@ def do_generate(
     sport: str,
     weeks: Optional[List[int]] = None,
     is_season: bool = False,
+    season_id: Optional[str] = None,
     late_pick_threshold: float = LATE_PICK_THRESHOLD,
     min_win_pct: float = MIN_WIN_PCT,
     min_games_for_win_pct: int = MIN_GAMES_FOR_WIN_PCT,
@@ -624,11 +598,13 @@ def do_generate(
     """Main generation function."""
     if sport.lower() == "all":
         input_csv = "db_trades.csv"
-        season_year = datetime.now().year
+        season_label = str(datetime.now().year)
     else:
         config = SPORTS_CONFIG[sport]
         input_csv = config["input_csv"]
-        season_year = config["season_year"]
+        season = get_season(sport, season_id)
+        season_id = season["season_id"]
+        season_label = season["label"]
 
     if not os.path.exists(input_csv):
         print(f"Input file not found: {input_csv}")
@@ -644,21 +620,31 @@ def do_generate(
         min_wins=min_wins,
     )
 
+    # Always constrain single-sport reports to the selected season window
+    if sport.lower() != "all":
+        print(f"Filtering to {sport} {season_label} season window...")
+        df = filter_by_season(df, sport, season_id)
+        print(f"   Filtered to {len(df):,} rows")
+
     # Filter by weeks if specified
     if weeks and not is_season and sport.lower() != "all":
         week_range = f"{min(weeks)}-{max(weeks)}" if len(weeks) > 1 else str(weeks[0])
         print(f"Filtering to Week(s) {week_range}...")
-        df = filter_by_weeks(df, weeks, sport)
+        df = filter_by_weeks(df, weeks, sport, season_id)
         print(f"   Filtered to {len(df):,} rows")
-        title = f"{sport} Weeks {week_range}"
+        title = f"{sport} {season_label} Weeks {week_range} (Postseason Included)"
     else:
-        title = f"{sport} Season {season_year}"
+        if sport.lower() == "all":
+            title = f"ALL Sports Season {season_label}"
+        else:
+            title = f"{sport} {season_label} Season (Postseason Included)"
 
     if df.empty:
         print("No data matches the filter criteria")
         return
 
     # Calculate stats and consensus
+    print("Build analysis table...")
     user_stats = calculate_user_stats(df)
     consensus = calculate_consensus(df)
 
@@ -667,7 +653,13 @@ def do_generate(
     market_summary = build_market_summary(df, consensus)
 
     # Generate output filename (using "analysis" prefix)
-    output_file = get_output_filename(weeks, is_season, sport, prefix="analysis")
+    output_file = get_output_filename(
+        weeks,
+        is_season,
+        sport,
+        prefix="analysis",
+        season_id=season_id,
+    )
 
     # Generate Excel
     generate_excel_flat(flat_df, output_file, title, market_summary=market_summary)
@@ -687,6 +679,7 @@ def main():
             help="Sport: NFL, NBA, CFB, CBB, or all",
         )
         parser.add_argument("--weeks", type=str, help="Weeks list (e.g., 5 or 3-5 or 1,2,3)")
+        parser.add_argument("--season-id", type=str, help="Season ID (e.g., 2025, 2025-26)")
         parser.add_argument("--season", action="store_true", help="Full season")
         parser.add_argument("--latest", action="store_true", help="Latest week")
         parser.add_argument("--previous", action="store_true", help="Previous week")
@@ -701,6 +694,17 @@ def main():
 
         sport_arg = args.sport.strip().lower()
         sport = "all" if sport_arg == "all" else sport_arg.upper()
+        selected_season_id = None
+
+        if sport != "all":
+            try:
+                selected_season = get_season(sport, args.season_id)
+                selected_season_id = selected_season["season_id"]
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
+        elif args.season_id:
+            print("Warning: --season-id is ignored when --sport all")
 
         def parse_weeks_arg(value: str) -> List[int]:
             value = value.strip()
@@ -723,13 +727,26 @@ def main():
                 weeks = None
                 is_season = True
             else:
-                current_week = get_current_week(sport)
+                current_week = get_current_week(sport, selected_season_id, include_postseason=True)
                 if args.latest:
-                    weeks = [current_week]
+                    if current_week == 0:
+                        print("Season has not started yet. Generating full season.")
+                        weeks = None
+                    else:
+                        weeks = [current_week]
                 elif args.previous:
-                    weeks = [max(current_week - 1, 1)]
+                    if current_week <= 1:
+                        print("Previous week is not available. Generating latest available week.")
+                        weeks = [current_week] if current_week > 0 else None
+                    else:
+                        weeks = [current_week - 1]
                 elif args.last5:
-                    weeks = get_last_n_weeks(5, sport)
+                    weeks = get_last_n_weeks(
+                        5, sport, selected_season_id, include_postseason=True
+                    )
+                    if not weeks:
+                        print("No active week found yet. Generating full season.")
+                        weeks = None
                 elif args.weeks:
                     weeks = parse_weeks_arg(args.weeks)
                 is_season = weeks is None
@@ -738,6 +755,7 @@ def main():
             sport=sport,
             weeks=weeks,
             is_season=is_season,
+            season_id=selected_season_id,
             late_pick_threshold=args.late_pick_threshold,
             min_win_pct=args.min_win_pct,
             min_games_for_win_pct=args.min_games_win_pct,
@@ -755,11 +773,15 @@ def main():
         do_generate(sport=sport, weeks=None, is_season=True)
         return
 
-    weeks, is_season = select_time_period(sport)
+    season_id = select_season(sport)
+    if not season_id or season_id == "exit":
+        return
+
+    weeks, is_season = select_time_period(sport, season_id)
     if weeks is None and not is_season:
         return
 
-    do_generate(sport=sport, weeks=weeks, is_season=is_season)
+    do_generate(sport=sport, weeks=weeks, is_season=is_season, season_id=season_id)
 
 
 if __name__ == "__main__":
