@@ -29,7 +29,7 @@ MIN_WINS = 3
 # `regular_weeks` is regular season length; `end_date` includes postseason cap.
 SPORTS_CONFIG = {
     "NFL": {
-        "input_csv": "db_trades_nfl.csv",
+        "input_file": "db_trades_nfl.parquet",
         "seasons": [
             {
                 "season_id": "2025",
@@ -47,10 +47,26 @@ SPORTS_CONFIG = {
                 "end_date": datetime(2025, 2, 9),
                 "default": False,
             },
+            {
+                "season_id": "2023",
+                "label": "2023",
+                "start_date": datetime(2023, 9, 7),
+                "regular_weeks": 18,
+                "end_date": datetime(2024, 2, 11),
+                "default": False,
+            },
+            {
+                "season_id": "2022",
+                "label": "2022",
+                "start_date": datetime(2022, 9, 8),
+                "regular_weeks": 18,
+                "end_date": datetime(2023, 2, 12),
+                "default": False,
+            },
         ],
     },
     "NBA": {
-        "input_csv": "db_trades_nba.csv",
+        "input_file": "db_trades_nba.parquet",
         "seasons": [
             {
                 "season_id": "2025-26",
@@ -68,10 +84,26 @@ SPORTS_CONFIG = {
                 "end_date": datetime(2025, 6, 23),
                 "default": False,
             },
+            {
+                "season_id": "2023-24",
+                "label": "2023-24",
+                "start_date": datetime(2023, 10, 24),
+                "regular_weeks": 26,
+                "end_date": datetime(2024, 6, 17),
+                "default": False,
+            },
+            {
+                "season_id": "2022-23",
+                "label": "2022-23",
+                "start_date": datetime(2022, 10, 18),
+                "regular_weeks": 26,
+                "end_date": datetime(2023, 6, 12),
+                "default": False,
+            },
         ],
     },
     "CFB": {
-        "input_csv": "db_trades_cfb.csv",
+        "input_file": "db_trades_cfb.parquet",
         "seasons": [
             {
                 "season_id": "2025",
@@ -89,10 +121,26 @@ SPORTS_CONFIG = {
                 "end_date": datetime(2025, 1, 20),
                 "default": False,
             },
+            {
+                "season_id": "2023",
+                "label": "2023",
+                "start_date": datetime(2023, 8, 26),
+                "regular_weeks": 16,
+                "end_date": datetime(2024, 1, 8),
+                "default": False,
+            },
+            {
+                "season_id": "2022",
+                "label": "2022",
+                "start_date": datetime(2022, 8, 27),
+                "regular_weeks": 16,
+                "end_date": datetime(2023, 1, 9),
+                "default": False,
+            },
         ],
     },
     "CBB": {
-        "input_csv": "db_trades_cbb.csv",
+        "input_file": "db_trades_cbb.parquet",
         "seasons": [
             {
                 "season_id": "2025-26",
@@ -110,11 +158,27 @@ SPORTS_CONFIG = {
                 "end_date": datetime(2025, 4, 8),
                 "default": False,
             },
+            {
+                "season_id": "2023-24",
+                "label": "2023-24",
+                "start_date": datetime(2023, 11, 6),
+                "regular_weeks": 22,
+                "end_date": datetime(2024, 4, 8),
+                "default": False,
+            },
+            {
+                "season_id": "2022-23",
+                "label": "2022-23",
+                "start_date": datetime(2022, 11, 7),
+                "regular_weeks": 22,
+                "end_date": datetime(2023, 4, 3),
+                "default": False,
+            },
         ],
     },
 }
 
-# Cache of latest week found in CSVs to avoid repeated reads.
+# Cache of latest week found in data files to avoid repeated reads.
 _MAX_WEEK_CACHE = {}
 
 
@@ -193,9 +257,9 @@ def _max_weeks_allowed(sport: str, season_id: str, include_postseason: bool = Tr
 # Schedule Functions
 # =============================================================================
 
-def get_csv_max_week(sport: str, season_id: Optional[str] = None) -> int:
+def get_max_week(sport: str, season_id: Optional[str] = None) -> int:
     """
-    Get max week number implied by latest game_start_time in the CSV
+    Get max week number implied by latest game_start_time in the data file
     for the selected season window.
 
     Args:
@@ -211,18 +275,16 @@ def get_csv_max_week(sport: str, season_id: Optional[str] = None) -> int:
     if cache_key in _MAX_WEEK_CACHE:
         return _MAX_WEEK_CACHE[cache_key]
 
-    input_csv = SPORTS_CONFIG[sport]["input_csv"]
+    input_file = SPORTS_CONFIG[sport]["input_file"]
     season_start = season["start_date"]
     season_end = season["end_date"]
     max_week = 0
 
-    if os.path.exists(input_csv):
+    if os.path.exists(input_file):
         try:
-            dates_df = pd.read_csv(input_csv, usecols=["game_start_time"])
-            game_dates = pd.to_datetime(
-                dates_df["game_start_time"].astype(str).str[:10],
-                errors="coerce",
-            )
+            dates_df = pd.read_parquet(input_file, columns=["game_start_time"])
+            # game_start_time is native datetime from Parquet
+            game_dates = pd.to_datetime(dates_df["game_start_time"], errors="coerce").dt.normalize()
             game_dates = game_dates[(game_dates >= season_start) & (game_dates <= season_end)]
             max_date = game_dates.max()
             if pd.notna(max_date):
@@ -233,6 +295,10 @@ def get_csv_max_week(sport: str, season_id: Optional[str] = None) -> int:
     max_week = min(max_week, _max_weeks_allowed(sport, resolved_season_id, include_postseason=True))
     _MAX_WEEK_CACHE[cache_key] = max_week
     return max_week
+
+
+# Backward-compatible alias
+get_csv_max_week = get_max_week
 
 
 def get_week_dates(week: int, sport: str, season_id: str) -> Tuple[str, str]:
@@ -279,7 +345,7 @@ def get_current_week(sport: str, season_id: str, include_postseason: bool = True
     season_start = season["start_date"]
     season_end = season["end_date"]
     max_weeks_allowed = _max_weeks_allowed(sport, season_id, include_postseason=include_postseason)
-    week_from_csv = get_csv_max_week(sport, season_id)
+    week_from_csv = get_max_week(sport, season_id)
 
     today = datetime.now()
     if today < season_start:

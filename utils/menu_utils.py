@@ -78,8 +78,8 @@ def select_sport(
 
     if check_csv and sport != "all":
         config = SPORTS_CONFIG[sport]
-        if not os.path.exists(config["input_csv"]):
-            print(f"\nWarning: {config['input_csv']} not found.")
+        if not os.path.exists(config["input_file"]):
+            print(f"\nWarning: {config['input_file']} not found.")
             print("Please run update_trades.py first to generate the data file.")
             return None
 

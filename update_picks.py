@@ -17,7 +17,6 @@ from utils.shared_utils import (
     MIN_GAMES_FOR_WIN_PCT,
     MIN_GAMES,
     MIN_WINS,
-    normalize_is_correct,
     coerce_numeric_series,
     parse_game_teams,
     get_season,
@@ -45,7 +44,7 @@ WRITE_PROGRESS_THRESHOLD = 2000
 # =============================================================================
 
 def load_and_transform(
-    input_csv: str,
+    input_file: str,
     late_pick_threshold: float = LATE_PICK_THRESHOLD,
     min_win_pct: float = MIN_WIN_PCT,
     min_games_for_win_pct: int = MIN_GAMES_FOR_WIN_PCT,
@@ -53,37 +52,31 @@ def load_and_transform(
     min_wins: int = MIN_WINS,
 ) -> pd.DataFrame:
     """
-    Load db_trades_nfl.csv and transform to expected format.
+    Load trade data from Parquet and transform to expected format.
 
     Transformations:
         - match_title -> game
         - game_start_time -> game_date (extract date)
-        - is_correct_pick -> result (TRUE->won, FALSE->lost, empty->pending)
+        - is_correct_pick -> result (True->won, False->lost, NA->pending)
     """
-    df = pd.read_csv(input_csv)
-    print(f"Load: {input_csv} ({len(df):,} rows)")
+    df = pd.read_parquet(input_file)
+    print(f"Load: {input_file} ({len(df):,} rows)")
 
     # Validate required columns exist
     required_cols = ['is_correct_pick', 'game_start_time', 'match_title',
                      'user_pick', 'yes_avg_price', 'no_avg_price', 'user_address']
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns in CSV: {missing}")
+        raise ValueError(f"Missing required columns: {missing}")
 
-    # Extract game_date from game_start_time (just take first 10 chars: YYYY-MM-DD)
-    df['game_date'] = df['game_start_time'].str[:10]
+    # Extract game_date from game_start_time (native datetime from Parquet)
+    df['game_date'] = df['game_start_time'].dt.strftime('%Y-%m-%d')
 
     # Create unique game identifier (match_title + date) to handle rematches
     df['game'] = df['match_title'] + ' (' + df['game_date'] + ')'
 
-    # Map is_correct_pick to result using shared normalize function
-    normalized_is_correct = df['is_correct_pick'].apply(normalize_is_correct)
-    df['is_correct_pick'] = normalized_is_correct
-    df['result'] = normalized_is_correct.map({True: 'won', False: 'lost'}).fillna('pending')
-
-    # Coerce price columns to numeric (remove commas if present)
-    df['yes_avg_price'] = coerce_numeric_series(df['yes_avg_price'])
-    df['no_avg_price'] = coerce_numeric_series(df['no_avg_price'])
+    # Map is_correct_pick to result (already nullable bool from Parquet)
+    df['result'] = df['is_correct_pick'].map({True: 'won', False: 'lost'}).fillna('pending')
 
     # Calculate user's entry price for their pick
     # If user_pick matches first team (Team A), use yes_avg_price, else no_avg_price
@@ -609,23 +602,23 @@ def do_generate(
 ):
     """Main generation function."""
     if sport.lower() == "all":
-        input_csv = "db_trades.csv"
+        input_file = "db_trades.parquet"
         season_label = str(datetime.now().year)
     else:
         config = SPORTS_CONFIG[sport]
-        input_csv = config["input_csv"]
+        input_file = config["input_file"]
         season = get_season(sport, season_id)
         season_id = season["season_id"]
         season_label = season["label"]
 
     # Check if input file exists
-    if not os.path.exists(input_csv):
-        print(f"Input file not found: {input_csv}")
+    if not os.path.exists(input_file):
+        print(f"Input file not found: {input_file}")
         return
 
     # Load and transform data
     df = load_and_transform(
-        input_csv,
+        input_file,
         late_pick_threshold=late_pick_threshold,
         min_win_pct=min_win_pct,
         min_games_for_win_pct=min_games_for_win_pct,

@@ -9,15 +9,21 @@ Polymarket Sports Analytics - tracks sports prediction market performance on Pol
 ## Commands
 
 ```bash
-# Install dependencies
+# Install dependencies (uses venv with Python 3.12)
 pip install -r requirements.txt
 
 # Run tests
 pytest tests/
 pytest tests/test_markets.py -v  # Single test file
 
-# Full pipeline
+# Full pipeline (must run in order)
 python update_markets.py && python update_trades.py && python update_picks.py
+
+# Optional: flat-table analysis (after trades are populated)
+python update_analyze.py
+
+# Migrate existing CSV data to Parquet (one-time)
+python update_trades.py --migrate
 
 # update_trades.py options
 python update_trades.py --resolved-only      # Only resolved markets
@@ -27,48 +33,118 @@ python update_trades.py --verbose            # Detailed output
 python update_trades.py --max-users N        # Limit users (testing)
 python update_trades.py --sport nfl          # Filter by sport
 python update_trades.py --pick-basis amount  # Classify picks by amount held
+
+# update_picks.py / update_analyze.py CLI mode
+python update_picks.py --sport NFL --season-id 2025 --weeks 5
+python update_picks.py --sport NBA --season-id 2025-26 --last5
+python update_analyze.py --sport CFB --season-id 2025 --weeks 3-5
 ```
 
 ## Architecture
 
-Three-stage CSV pipeline:
+Four-stage Parquet pipeline:
 
 ```
 Gamma API (REST)           GraphQL Subgraphs (Goldsky)
       │                           │
       ▼                           ▼
 update_markets.py ──► update_trades.py ──► update_picks.py
-      │                    │                    │
-      ▼                    ▼                    ▼
-db_markets.csv       db_trades_*.csv      leaderboard_*.xlsx
+      │                    │              ──► update_analyze.py
+      ▼                    ▼                    │
+db_markets.parquet   db_trades_*.parquet   leaderboard_*.xlsx / analysis_*.xlsx
 ```
 
-**Stage 1 - update_markets.py**: Fetches moneyline markets from Polymarket Gamma API by series ID (NFL=10187, CFB=10210, NBA=10345, CBB=10470). Filters to moneyline only, determines winners (price > 0.95).
+**Stage 1 - update_markets.py**: Fetches moneyline markets from Polymarket Gamma API by series ID (NFL=10187, CFB=10210, NBA=10345, CBB=10470). Filters to moneyline only, determines winners (price > 0.95). Deduplicates on `condition_id`.
 
-**Stage 2 - update_trades.py**: Queries user positions from Goldsky GraphQL subgraphs. Calculates realized/unrealized P&L, determines user picks and correctness. Uses cursor-based pagination with rate limiting (50 req/10 sec).
+**Stage 2 - update_trades.py**: Queries user positions from Goldsky GraphQL subgraphs. Calculates realized/unrealized P&L, determines user picks and correctness. Uses cursor-based pagination with rate limiting. Supports incremental processing (skips already-processed markets unless `--force-reprocess`). Accumulates all rows in memory and writes Parquet once at the end.
 
-**Stage 3 - update_picks.py**: Interactive menu for sport/week selection. Generates Excel with conditional formatting (green=win, red=loss, yellow=pending), frozen panes, clickable Polymarket profile links, and consensus formulas.
+**Stage 3a - update_picks.py**: Interactive menu or CLI for sport/week selection. Generates Excel leaderboard with pick-by-pick grid, conditional formatting (green=win, red=loss, yellow=pending), frozen panes, clickable Polymarket profile links, and consensus formulas.
+
+**Stage 3b - update_analyze.py**: Generates flat-table Excel analysis with one row per user per game. Includes entry prices, consensus percentages, and a separate markets sheet.
+
+### Utility Modules (utils/)
+
+| Module | Purpose |
+|--------|---------|
+| `shared_utils.py` | SPORTS_CONFIG, season/week filtering, team parsing, boolean coercion |
+| `excel_utils.py` | Cell styling (GREEN_FILL, RED_FILL, YELLOW_FILL), hyperlinks, header formatting |
+| `menu_utils.py` | Interactive sport/season/time-period selection menus |
+| `__init__.py` | Re-exports from all utility modules |
+
+`shared_utils.py` is the central configuration hub containing `SPORTS_CONFIG` (multi-season sport definitions with `season_start`, `total_weeks`, `default` flag, and `input_file` pointing to sport-specific Parquet files).
 
 ## Key Filtering Logic
 
-- **Late picks excluded**: Individual picks with price >= 0.95 are filtered out
-- **Accuracy threshold**: Users need 70% accuracy with minimum 5 games to appear on leaderboard
-- **Moneyline only**: Spreads, totals, and props are excluded
+- **Late picks excluded**: Individual picks with price >= 0.95 are filtered out (configurable via `--late-pick-threshold`)
+- **Accuracy threshold**: Users need 70% accuracy with minimum 5 games to appear on leaderboard (configurable via `--min-win-pct`, `--min-games-win-pct`)
+- **Minimum activity**: Configurable minimum games/wins (`--min-games`, `--min-wins`)
+- **Moneyline only**: Spreads, totals, and props are excluded via `is_moneyline_market()` heuristics
+
+## Key Constants
+
+| Constant | Value | Location |
+|----------|-------|----------|
+| COLLATERAL_SCALE | 1,000,000 | update_trades.py (USDC has 6 decimals) |
+| LATE_PICK_THRESHOLD | 0.95 | shared_utils.py |
+| WINNER_PRICE_THRESHOLD | 0.95 | update_markets.py |
+| MIN_WIN_PCT | 70.0 | shared_utils.py |
+| MIN_GAMES_FOR_WIN_PCT | 5 | shared_utils.py |
+| RATE_LIMIT_REQUESTS_PER_SECOND | 25.0 | update_trades.py |
+| MAX_RETRIES | 3 | update_trades.py |
+
+## PNL Formulas
+
+```
+Unrealized PNL = amount * (current_price - avg_price)
+Total PNL = realized_pnl + unrealized_pnl
+ROI % = (total_pnl / total_bought) * 100
+Week = ((game_date - season_start).days // 7) + 1
+```
 
 ## Data Files
 
 | File | Description |
 |------|-------------|
-| `db_markets.csv` | All moneyline markets (generated) |
-| `db_trades_{sport}.csv` | Sport-specific trade data with P&L |
-| `leaderboard_{sport}_weeks_{N}-{M}.xlsx` | Excel leaderboard output |
+| `db_markets.parquet` | All moneyline markets (generated by stage 1) |
+| `db_trades.parquet` | Combined trade data with P&L (generated by stage 2) |
+| `db_trades_{sport}.parquet` | Sport-specific trade data with P&L (segmented by stage 2) |
+| `leaderboard_{sport}_weeks_{N}-{M}.xlsx` | Excel leaderboard output (stage 3a) |
+| `analysis_{sport}_weeks_{N}-{M}.xlsx` | Flat-table analysis output (stage 3b) |
+| `logs/*.log` | Runtime logs (markets.log, trades.log, picks.log) |
 
-## Sport Configuration (in update_picks.py)
+### Parquet Type Schema (db_trades)
 
-Each sport has season_start date and total_weeks configured. Week calculations are based on these values for time window filtering.
+| Column | Type | Notes |
+|--------|------|-------|
+| `is_correct_pick` | `pd.BooleanDtype()` | Nullable: True/False/pd.NA |
+| `is_resolved` | `bool` | Native boolean |
+| `game_start_time` | `datetime64[ns]` | Native timestamp |
+| Numeric columns | `float64` | Full precision (no rounding) |
+
+## Dependencies
+
+- `pyarrow>=14.0.0` - Parquet read/write engine
+- `pandas>=2.0.0` - Data processing
+- `openpyxl>=3.1.0` - Excel generation
+- `requests>=2.28.0` - HTTP client
 
 ## API Rate Limits
 
 - Gamma API: 500 events per paginated request
-- GraphQL: 50 requests per 10 seconds with exponential backoff
-- Batch processing: 500 users per GraphQL query
+- GraphQL: Rate-limited with exponential backoff (MAX_RETRIES=3, base delay 2s)
+- Batch processing: 500 users per GraphQL query, auto-splits on timeout
+- Connection pooling via `requests.Session()`
+
+## Resilience Patterns
+
+- **Batch splitting**: On GraphQL timeout, batches are halved recursively (min batch size 50)
+- **Condition cache**: In-memory dict (`_condition_cache`) avoids redundant subgraph queries
+- **Max week cache**: `_MAX_WEEK_CACHE` prevents repeated Parquet reads for latest week
+- **Processed markets tracking**: `get_processed_markets()` enables incremental processing
+- **Native types**: Parquet stores bool/float64/datetime natively, eliminating CSV type coercion issues
+
+## Interactive vs CLI Mode
+
+Both `update_picks.py` and `update_analyze.py` support dual modes:
+- **Interactive**: Run without args for menu-driven sport/season/time selection
+- **CLI**: Pass `--sport`, `--season-id`, `--weeks`, `--last5`, or `--season` flags

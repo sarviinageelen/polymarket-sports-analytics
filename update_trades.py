@@ -10,10 +10,10 @@ Data Sources:
     - Orderbook Subgraph: Current market prices from recent trades
 
 Input:
-    - db_markets.csv: List of markets (from update_markets.py)
+    - db_markets.parquet: List of markets (from update_markets.py)
 
 Output:
-    - db_trades.csv: Trade records with PNL calculations:
+    - db_trades.parquet: Trade records with PNL calculations:
         - User position data (holdings, avg price, total bought)
         - Realized PNL (from closed positions)
         - Unrealized PNL (current value - cost basis)
@@ -30,13 +30,13 @@ Usage:
     python update_trades.py --max-users 10   # Limit users per market (testing)
 
 Architecture:
-    1. Load markets from db_markets.csv (filtered by --resolved-only/--unresolved-only)
+    1. Load markets from db_markets.parquet (filtered by --resolved-only/--unresolved-only)
     2. For each market:
        a. Fetch all users with positions via cursor-based pagination
        b. Batch query user positions (500 users per batch)
        c. Fetch current prices once per market
        d. Calculate PNL for each user
-    3. Write results to CSV in batches (for performance)
+    3. Write results to Parquet (accumulated in memory, written once)
 
 API Rate Limiting:
     - Goldsky endpoints: 50 requests per 10 seconds
@@ -51,7 +51,6 @@ Caching:
 import argparse
 import requests
 from typing import Dict, Optional, List
-import csv
 import os
 import time
 import logging
@@ -165,7 +164,7 @@ def _filter_moneyline_markets(df: pd.DataFrame) -> pd.DataFrame:
 
     removed = original - len(df)
     if removed > 0:
-        print(f"Filtered out {removed} non-moneyline markets from input CSV")
+        print(f"Filtered out {removed} non-moneyline markets from input")
     return df
 
 
@@ -184,18 +183,6 @@ def _coerce_bool(value) -> bool:
         return False
     return False
 
-
-def _read_csv_with_bool(path: str, usecols: Optional[List[str]] = None) -> pd.DataFrame:
-    """Read CSV and coerce `is_resolved` to boolean if present."""
-    df = pd.read_csv(
-        path,
-        usecols=usecols,
-        true_values=list(BOOL_TRUE),
-        false_values=list(BOOL_FALSE),
-    )
-    if "is_resolved" in df.columns:
-        df["is_resolved"] = df["is_resolved"].apply(_coerce_bool)
-    return df
 
 
 # ============================================================================
@@ -586,8 +573,8 @@ def format_usdc(amount: float) -> str:
     return f"${amount / COLLATERAL_SCALE:.2f}"
 
 
-# CSV column definitions
-CSV_FIELDNAMES = [
+# Trade column definitions
+TRADE_COLUMNS = [
     "sport", "condition_id", "match_title",
     "game_start_time", "is_resolved", "winning_outcome", "user_address",
     "user_pick", "is_correct_pick",
@@ -655,7 +642,7 @@ def determine_user_pick(
     if yes_bought == 0 and no_bought == 0 and yes_amount == 0 and no_amount == 0:
         return "NONE"
 
-    # Prefer outcome team labels (from db_markets.csv) to avoid abbreviation mismatches
+    # Prefer outcome team labels (from db_markets) to avoid abbreviation mismatches
     team_a = (outcome_team_a or "").strip()
     team_b = (outcome_team_b or "").strip()
 
@@ -687,28 +674,28 @@ def determine_user_pick(
 def calculate_is_correct_pick(user_pick, winning_outcome):
     """
     Check if the user's pick matches the market's winning outcome.
-    
+
     Args:
         user_pick: User's predicted team/outcome (from determine_user_pick)
         winning_outcome: Actual winning team/outcome from market resolution
-    
+
     Returns:
-        "TRUE" - User picked correctly
-        "FALSE" - User picked incorrectly
-        "" (empty) - No pick, or market not yet resolved
-    
+        True - User picked correctly
+        False - User picked incorrectly
+        None - No pick, or market not yet resolved
+
     Note:
         Comparison is exact string match, so team names must be
         consistently formatted between user_pick and winning_outcome.
     """
     if not user_pick or user_pick == "NONE":
-        return ""
+        return None
     if not winning_outcome or winning_outcome == "Pending":
-        return ""  # Not yet resolved
-    return "TRUE" if user_pick == winning_outcome else "FALSE"
+        return None  # Not yet resolved
+    return True if user_pick == winning_outcome else False
 
 
-def build_csv_row(
+def build_trade_row(
     condition_id: str,
     user_address: str,
     results: Dict,
@@ -716,27 +703,25 @@ def build_csv_row(
     pick_basis: str = DEFAULT_PICK_BASIS,
 ) -> Dict:
     """
-    Build a complete CSV row dict from PNL calculation results.
-    
-    Transforms raw position data and PNL calculations into a formatted
-    row ready for CSV output. All monetary values are formatted with
-    comma separators and appropriate decimal places.
-    
+    Build a trade row dict from PNL calculation results.
+
+    Transforms raw position data and PNL calculations into a row
+    with native Python types (float, bool, None) for Parquet output.
+
     Args:
         condition_id: Market's condition ID
         user_address: User's wallet address
         results: Dict with YES/NO position data and PNL calculations
         market_metadata: Optional dict with sport, match_title, game_start_time,
                         is_resolved, and winning_outcome
-    
+
     Returns:
-        Dict with keys matching CSV_FIELDNAMES, ready for DictWriter.
-        All values are strings formatted for human readability.
+        Dict with keys matching TRADE_COLUMNS, with native types.
     """
     yes_pos = results["YES"]["position"]
     no_pos = results["NO"]["position"]
     metadata = market_metadata or {}
-    
+
     # Determine user's pick and if it was correct
     match_title = metadata.get("match_title", "")
     winning_outcome = metadata.get("winning_outcome", "")
@@ -750,105 +735,86 @@ def build_csv_row(
     )
     is_correct = calculate_is_correct_pick(user_pick, winning_outcome)
 
+    def _float(val):
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
     return {
         "sport": metadata.get("sport", ""),
         "condition_id": condition_id,
         "match_title": match_title,
         "game_start_time": metadata.get("game_start_time", ""),
-        "is_resolved": metadata.get("is_resolved", ""),
+        "is_resolved": metadata.get("is_resolved", False),
         "winning_outcome": winning_outcome,
         "user_address": user_address,
         "user_pick": user_pick,
         "is_correct_pick": is_correct,
-        "yes_current_holdings": as_number(float(yes_pos["amount"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
-        "yes_avg_price": as_number(float(yes_pos["avgPrice"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0, decimals=PRICE_DECIMALS),
-        "yes_total_bought": as_number(float(yes_pos["totalBought"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0),
-        "yes_current_price": as_number(
-            results["YES"]["current_price"] / COLLATERAL_SCALE if results["YES"]["current_price"] is not None else None,
-            decimals=PRICE_DECIMALS,
-        ),
-        "yes_realized_pnl": as_number(results["YES"]["realized_pnl"] / COLLATERAL_SCALE),
-        "yes_unrealized_pnl": as_number(results["YES"]["unrealized_pnl"] / COLLATERAL_SCALE),
-        "yes_total_pnl": as_number(results["YES"]["total_pnl"] / COLLATERAL_SCALE),
-        "no_current_holdings": as_number(float(no_pos["amount"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
-        "no_avg_price": as_number(float(no_pos["avgPrice"]) / COLLATERAL_SCALE if no_pos is not None else 0.0, decimals=PRICE_DECIMALS),
-        "no_total_bought": as_number(float(no_pos["totalBought"]) / COLLATERAL_SCALE if no_pos is not None else 0.0),
-        "no_current_price": as_number(
-            results["NO"]["current_price"] / COLLATERAL_SCALE if results["NO"]["current_price"] is not None else None,
-            decimals=PRICE_DECIMALS,
-        ),
-        "no_realized_pnl": as_number(results["NO"]["realized_pnl"] / COLLATERAL_SCALE),
-        "no_unrealized_pnl": as_number(results["NO"]["unrealized_pnl"] / COLLATERAL_SCALE),
-        "no_total_pnl": as_number(results["NO"]["total_pnl"] / COLLATERAL_SCALE),
-        "total_realized_pnl": as_number((results["YES"]["realized_pnl"] + results["NO"]["realized_pnl"]) / COLLATERAL_SCALE),
-        "total_unrealized_pnl": as_number((results["YES"]["unrealized_pnl"] + results["NO"]["unrealized_pnl"]) / COLLATERAL_SCALE),
-        "total_pnl": as_number((results["YES"]["total_pnl"] + results["NO"]["total_pnl"]) / COLLATERAL_SCALE)
+        "yes_current_holdings": float(yes_pos["amount"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0,
+        "yes_avg_price": float(yes_pos["avgPrice"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0,
+        "yes_total_bought": float(yes_pos["totalBought"]) / COLLATERAL_SCALE if yes_pos is not None else 0.0,
+        "yes_current_price": _float(results["YES"]["current_price"] / COLLATERAL_SCALE) if results["YES"]["current_price"] is not None else None,
+        "yes_realized_pnl": results["YES"]["realized_pnl"] / COLLATERAL_SCALE,
+        "yes_unrealized_pnl": results["YES"]["unrealized_pnl"] / COLLATERAL_SCALE,
+        "yes_total_pnl": results["YES"]["total_pnl"] / COLLATERAL_SCALE,
+        "no_current_holdings": float(no_pos["amount"]) / COLLATERAL_SCALE if no_pos is not None else 0.0,
+        "no_avg_price": float(no_pos["avgPrice"]) / COLLATERAL_SCALE if no_pos is not None else 0.0,
+        "no_total_bought": float(no_pos["totalBought"]) / COLLATERAL_SCALE if no_pos is not None else 0.0,
+        "no_current_price": _float(results["NO"]["current_price"] / COLLATERAL_SCALE) if results["NO"]["current_price"] is not None else None,
+        "no_realized_pnl": results["NO"]["realized_pnl"] / COLLATERAL_SCALE,
+        "no_unrealized_pnl": results["NO"]["unrealized_pnl"] / COLLATERAL_SCALE,
+        "no_total_pnl": results["NO"]["total_pnl"] / COLLATERAL_SCALE,
+        "total_realized_pnl": (results["YES"]["realized_pnl"] + results["NO"]["realized_pnl"]) / COLLATERAL_SCALE,
+        "total_unrealized_pnl": (results["YES"]["unrealized_pnl"] + results["NO"]["unrealized_pnl"]) / COLLATERAL_SCALE,
+        "total_pnl": (results["YES"]["total_pnl"] + results["NO"]["total_pnl"]) / COLLATERAL_SCALE,
     }
 
 
-def write_rows_to_csv(rows: List[Dict], csv_file: Optional[str] = None):
+def _build_trades_dataframe(rows: List[Dict]) -> pd.DataFrame:
     """
-    Write multiple rows to CSV in a single file operation.
-    
-    Batched writes are significantly faster than per-row writes,
-    especially for large datasets. Creates file with header if
-    it doesn't exist, appends otherwise.
-    
+    Build a properly-typed DataFrame from trade row dicts.
+
+    Ensures correct dtypes for Parquet storage:
+    - is_correct_pick: nullable boolean (True/False/pd.NA)
+    - is_resolved: native bool
+    - game_start_time: datetime64[ns]
+    - numeric columns: float64
+    """
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # Convert is_correct_pick to nullable boolean
+    df["is_correct_pick"] = df["is_correct_pick"].map(
+        {True: True, False: False, None: pd.NA}
+    ).astype(pd.BooleanDtype())
+
+    # Convert is_resolved to bool
+    df["is_resolved"] = df["is_resolved"].apply(_coerce_bool)
+
+    # Convert game_start_time to datetime
+    df["game_start_time"] = pd.to_datetime(df["game_start_time"], errors="coerce")
+
+    return df
+
+
+def write_trades_parquet(rows: List[Dict], output_file: Optional[str] = None):
+    """
+    Write trade rows to a Parquet file.
+
     Args:
-        rows: List of dicts with keys matching CSV_FIELDNAMES
-        csv_file: Output file path (defaults to db_trades.csv)
-    
-    Note:
-        Uses DictWriter in append mode with automatic header handling.
+        rows: List of trade row dicts (from build_trade_row)
+        output_file: Output file path (defaults to db_trades.parquet)
     """
-    if csv_file is None:
-        csv_file = "db_trades.csv"
-    
+    if output_file is None:
+        output_file = "db_trades.parquet"
+
     if not rows:
         return
-    
-    file_exists = os.path.isfile(csv_file)
-    
-    with open(csv_file, mode='a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
-        
-        if not file_exists:
-            writer.writeheader()
-        
-        writer.writerows(rows)
 
-
-def write_to_csv(
-    condition_id: str,
-    user_address: str,
-    results: Dict,
-    csv_file: Optional[str] = None,
-    verbose: bool = True,
-    market_metadata: Optional[Dict] = None,
-    pick_basis: str = DEFAULT_PICK_BASIS,
-):
-    """
-    Write a single user's PNL result to CSV file.
-    
-    Legacy function for individual writes. For batch operations,
-    use build_csv_row() + write_rows_to_csv() instead for better performance.
-    
-    Args:
-        condition_id: Market's condition ID
-        user_address: User's wallet address
-        results: PNL calculation results dict
-        csv_file: Output file path (defaults to db_trades.csv)
-        verbose: If True, prints confirmation message
-        market_metadata: Optional market info dict
-    """
-    if csv_file is None:
-        csv_file = "db_trades.csv"
-    
-    row = build_csv_row(condition_id, user_address, results, market_metadata, pick_basis=pick_basis)
-    write_rows_to_csv([row], csv_file)
-    
-    if verbose:
-        print(f"\nResults appended to {csv_file}")
+    df = _build_trades_dataframe(rows)
+    df.to_parquet(output_file, index=False, engine="pyarrow")
 
 
 def get_all_users_for_market(condition_id: str) -> List[str]:
@@ -995,7 +961,7 @@ def get_batch_user_positions(user_addresses: List[str], position_ids: List[str])
 
 def calculate_pnl_for_all_users(
     condition_id: str,
-    output_csv: Optional[str] = None,
+    output_file: Optional[str] = None,
     verbose: bool = False,
     max_users: Optional[int] = None,
     batch_size: int = 500,  # Increased from 100 for faster processing
@@ -1004,32 +970,24 @@ def calculate_pnl_for_all_users(
 ):
     """
     Calculate PNL for every trader in a resolved market.
-    
+
     High-throughput batch processing that minimizes API calls:
     1. Discover all users who traded in the market
     2. Fetch current prices ONCE (same for all users)
     3. Batch-fetch user positions (500 users per query)
-    4. Calculate PNL in-memory, batch-write to CSV
-    
+    4. Calculate PNL in-memory, return rows for caller to accumulate
+
     Args:
         condition_id: Market's condition ID
-        output_csv: CSV file path (defaults to db_trades.csv)
+        output_file: Unused (kept for API compatibility); rows are returned
         verbose: If True, prints per-user details; if False, shows progress bar
         max_users: Optional limit for testing (None = all users)
         batch_size: Users per batch query (default 500)
         market_metadata: Dict with sport, match_title, game_start_time, etc.
-    
+
     Returns:
-        Summary dict with total_users, successful, failed, elapsed_time
-    
-    Performance:
-        - Processes ~100+ users/second with batching
-        - Single price fetch shared across all users
-        - Single CSV write at end (not per-user)
+        Dict with total_users, successful, failed, elapsed_time, rows
     """
-    if output_csv is None:
-        output_csv = "db_trades.csv"
-    
     # Get all users
     all_users = get_all_users_for_market(condition_id)
 
@@ -1129,8 +1087,8 @@ def calculate_pnl_for_all_users(
                     batch_pnl_sum += total_pnl
                     total_pnl_sum += total_pnl
 
-                    # Build row for batch CSV write (much faster than per-user writes)
-                    row = build_csv_row(
+                    # Build row for batch write
+                    row = build_trade_row(
                         condition_id,
                         user_address,
                         results,
@@ -1173,10 +1131,6 @@ def calculate_pnl_for_all_users(
     if not verbose:
         print()  # Add newline after final progress update
 
-    # Batch write all rows to CSV (single file operation instead of per-user)
-    if rows_to_write:
-        write_rows_to_csv(rows_to_write, output_csv)
-
     elapsed_time = time.time() - start_time
     avg_pnl = total_pnl_sum / successful if successful > 0 else 0
 
@@ -1189,16 +1143,17 @@ def calculate_pnl_for_all_users(
         status += f" | {failed} failed"
     print(f"  {status}")
 
-    # Return summary statistics
+    # Return summary statistics and rows for caller to accumulate
     return {
         "total_users": total_users,
         "successful": successful,
         "failed": failed,
-        "elapsed_time": elapsed_time
+        "elapsed_time": elapsed_time,
+        "rows": rows_to_write,
     }
 
 
-def get_processed_markets(output_csv: str) -> dict:
+def get_processed_markets(output_file: str) -> dict:
     """
     Get dict of condition_ids already processed with their resolution status and outcome.
 
@@ -1208,17 +1163,17 @@ def get_processed_markets(output_csv: str) -> dict:
     when they become resolved or when the winner changes.
 
     Args:
-        output_csv: Path to the output CSV file (db_trades.csv)
+        output_file: Path to the output Parquet file (db_trades.parquet)
 
     Returns:
         Dict mapping condition_id -> {'is_resolved': bool, 'winning_outcome': str}.
         Returns empty dict if file doesn't exist or is unreadable.
     """
-    if not os.path.isfile(output_csv):
+    if not os.path.isfile(output_file):
         return {}
 
     try:
-        df = _read_csv_with_bool(output_csv, usecols=['condition_id', 'is_resolved', 'winning_outcome'])
+        df = pd.read_parquet(output_file, columns=['condition_id', 'is_resolved', 'winning_outcome'])
         # Get unique condition_id with their resolution status (take first occurrence)
         unique_markets = df.drop_duplicates(subset=['condition_id'])
         result = {}
@@ -1234,8 +1189,8 @@ def get_processed_markets(output_csv: str) -> dict:
 
 
 def process_all_markets(
-    markets_csv: Optional[str] = None,
-    output_csv: Optional[str] = None,
+    markets_file: Optional[str] = None,
+    output_file: Optional[str] = None,
     verbose: bool = False,
     max_users_per_market: Optional[int] = None,
     force_reprocess: bool = False,
@@ -1247,24 +1202,23 @@ def process_all_markets(
     Process markets and calculate PNL for every user.
 
     Main entry point for batch PNL calculation. Reads markets
-    from db_markets.csv and generates comprehensive trade data.
+    from db_markets.parquet and generates comprehensive trade data.
 
     Features:
     - Incremental processing: skips markets already in output
     - Progress tracking with ETA for each market
-    - Excel-friendly date formatting (YYYY-MM-DD HH:MM:SS)
     - Resume capability after interruption
     - Flexible filtering: all, resolved-only, or unresolved-only
 
     Args:
-        markets_csv: Input markets file (defaults to db_markets.csv)
-        output_csv: Output trades file (defaults to db_trades.csv)
+        markets_file: Input markets file (defaults to db_markets.parquet)
+        output_file: Output trades file (defaults to db_trades.parquet)
         verbose: If True, prints per-user details
         max_users_per_market: Limit users per market (for testing)
         force_reprocess: If True, deletes output and starts fresh
         market_filter: Filter markets - "all", "resolved", or "unresolved"
 
-    Output (db_trades.csv):
+    Output (db_trades.parquet):
         One row per user per market with position sizes, entry prices,
         realized/unrealized PNL, user pick, and correctness.
 
@@ -1273,22 +1227,22 @@ def process_all_markets(
         - Within each market, uses batch processing for users
         - Typical runtime: 1-5 minutes per market depending on user count
     """
-    if markets_csv is None:
-        markets_csv = "db_markets.csv"
-    if output_csv is None:
-        output_csv = "db_trades.csv"
-    
+    if markets_file is None:
+        markets_file = "db_markets.parquet"
+    if output_file is None:
+        output_file = "db_trades.parquet"
+
     # Validate input file exists
-    if not os.path.isfile(markets_csv):
-        print(f"Error: Markets file not found: {markets_csv}")
+    if not os.path.isfile(markets_file):
+        print(f"Error: Markets file not found: {markets_file}")
         print("Run update_markets.py first to fetch market data.")
-        logger.error(f"Markets file not found: {markets_csv}")
+        logger.error(f"Markets file not found: {markets_file}")
         return
-    
-    logger.info(f"Starting trade processing from {markets_csv}")
-    
-    # Read markets CSV
-    markets_df = _read_csv_with_bool(markets_csv)
+
+    logger.info(f"Starting trade processing from {markets_file}")
+
+    # Read markets Parquet
+    markets_df = pd.read_parquet(markets_file)
 
     # Filter by sport if specified
     if sport_filter != "all":
@@ -1316,11 +1270,11 @@ def process_all_markets(
         return
 
     # Check for existing output and determine what needs processing
-    if force_reprocess and os.path.isfile(output_csv):
-        os.remove(output_csv)
+    if force_reprocess and os.path.isfile(output_file):
+        os.remove(output_file)
         processed_markets = {}
     else:
-        processed_markets = get_processed_markets(output_csv)
+        processed_markets = get_processed_markets(output_file)
 
     # Find markets that need re-processing:
     # 1. Markets that were unresolved before but are now resolved
@@ -1347,18 +1301,18 @@ def process_all_markets(
                 markets_to_reprocess.append(cid)
 
     # Remove old rows for markets that need re-processing
-    if markets_to_reprocess and os.path.isfile(output_csv):
+    if markets_to_reprocess and os.path.isfile(output_file):
         print(f"Re-processing {len(markets_to_reprocess)} markets (unresolved + newly resolved)...")
         try:
-            df_existing = pd.read_csv(output_csv, low_memory=False)
+            df_existing = pd.read_parquet(output_file)
             df_existing = df_existing[~df_existing['condition_id'].isin(markets_to_reprocess)]
-            df_existing.to_csv(output_csv, index=False)
+            df_existing.to_parquet(output_file, index=False, engine="pyarrow")
             # Update processed_markets to exclude re-processing markets
             for cid in markets_to_reprocess:
                 del processed_markets[cid]
         except Exception as e:
-            logger.error(f"Failed to update CSV for re-processing: {e}")
-            print(f"Error: Could not update {output_csv}: {e}")
+            logger.error(f"Failed to update Parquet for re-processing: {e}")
+            print(f"Error: Could not update {output_file}: {e}")
             return
 
     # Filter out already processed markets (excluding those marked for re-processing)
@@ -1385,11 +1339,12 @@ def process_all_markets(
     print(f"  Resolved: {resolved_count} | Unresolved: {unresolved_count}")
     print(f"{'='*50}")
 
-    # Processing loop
+    # Processing loop - accumulate all rows in memory
     processed = 0
     failed = 0
     start_time = time.time()
     total_users_processed = 0
+    all_rows = []
 
     for idx, (_, market) in enumerate(markets_to_process.iterrows(), 1):
         try:
@@ -1403,20 +1358,15 @@ def process_all_markets(
             print(f"  {market['outcome_team_a']} vs {market['outcome_team_b']}")
 
             # Prepare market metadata
-            # Format game_start_time for Excel date recognition
-            game_time_str = str(market['game_start_time'])
-            try:
-                # Parse and format as YYYY-MM-DD HH:MM:SS for Excel
-                if dateutil_parser is not None:
-                    dt = dateutil_parser.parse(game_time_str)
-                    game_time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+            # game_start_time is already datetime from Parquet; convert to string for row building
+            game_time_val = market['game_start_time']
+            if pd.notna(game_time_val):
+                if isinstance(game_time_val, str):
+                    game_time_str = game_time_val
                 else:
-                    # Fallback: try pandas datetime parsing
-                    dt = pd.to_datetime(game_time_str)
-                    game_time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-            except Exception as e:
-                logger.debug(f"Could not parse date '{game_time_str}': {e}")
-                pass  # Keep original if parsing fails
+                    game_time_str = pd.Timestamp(game_time_val).strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                game_time_str = ""
 
             market_metadata = {
                 "sport": str(market['sport']),
@@ -1431,16 +1381,16 @@ def process_all_markets(
             # Calculate PNL for all users in this market
             market_summary = calculate_pnl_for_all_users(
                 condition_id=market['condition_id'],
-                output_csv=output_csv,
                 verbose=verbose,
                 max_users=max_users_per_market,
                 market_metadata=market_metadata,
                 pick_basis=pick_basis,
             )
 
-            # Track cumulative statistics
+            # Track cumulative statistics and accumulate rows
             if market_summary:
                 total_users_processed += market_summary['successful']
+                all_rows.extend(market_summary.get('rows', []))
 
             processed += 1
 
@@ -1451,8 +1401,19 @@ def process_all_markets(
             traceback.print_exc()
             print("-"*80)
 
+    # Write all accumulated rows to Parquet
+    if all_rows:
+        new_df = _build_trades_dataframe(all_rows)
+
+        # For incremental mode: merge with existing data
+        if os.path.isfile(output_file) and not force_reprocess:
+            existing_df = pd.read_parquet(output_file)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            combined_df.to_parquet(output_file, index=False, engine="pyarrow")
+        else:
+            new_df.to_parquet(output_file, index=False, engine="pyarrow")
+
     elapsed_time = time.time() - start_time
-    avg_time_per_market = elapsed_time / processed if processed > 0 else 0
 
     # Final summary
     print(f"\n{'='*50}")
@@ -1460,10 +1421,10 @@ def process_all_markets(
     if failed > 0:
         print(f"  Failed: {failed} markets")
     print(f"{'='*50}")
-    
+
     # Segment trades by sport
     print("\nSegmenting trades by sport...")
-    segment_trades_by_sport(output_csv)
+    segment_trades_by_sport(output_file)
     print()
 
 
@@ -1514,62 +1475,110 @@ def select_resolution_status() -> Optional[str]:
     return status_map.get(choice)
 
 
-def segment_trades_by_sport(trades_csv: str = "db_trades.csv"):
+def segment_trades_by_sport(trades_file: str = "db_trades.parquet"):
     """
-    Segment trades CSV into separate files by sport.
-    
+    Segment trades Parquet into separate files by sport.
+
     Creates:
-        - db_trades_nfl.csv
-        - db_trades_nba.csv
-        - db_trades_cfb.csv
-    
+        - db_trades_nfl.parquet
+        - db_trades_nba.parquet
+        - db_trades_cfb.parquet
+        - db_trades_cbb.parquet
+
     Args:
-        trades_csv: Path to the combined trades CSV file
+        trades_file: Path to the combined trades Parquet file
     """
-    if not os.path.isfile(trades_csv):
-        print(f"  Trades file not found: {trades_csv}")
+    if not os.path.isfile(trades_file):
+        print(f"  Trades file not found: {trades_file}")
         return
-    
+
     sport_files = {
-        "nfl": "db_trades_nfl.csv",
-        "nba": "db_trades_nba.csv",
-        "cfb": "db_trades_cfb.csv",
-        "cbb": "db_trades_cbb.csv",
+        "nfl": "db_trades_nfl.parquet",
+        "nba": "db_trades_nba.parquet",
+        "cfb": "db_trades_cfb.parquet",
+        "cbb": "db_trades_cbb.parquet",
     }
 
-    # Prepare output files (overwrite existing)
-    file_written = {sport: False for sport in sport_files}
-    counts = {sport: 0 for sport in sport_files}
-    for filename in sport_files.values():
-        if os.path.isfile(filename):
-            os.remove(filename)
-
-    # Stream through CSV to avoid loading large files into memory
-    for chunk in pd.read_csv(trades_csv, chunksize=200_000, dtype=str, low_memory=False):
-        # Normalize sport column
-        chunk['sport'] = chunk['sport'].astype(str).str.lower().str.strip()
-
-        for sport, filename in sport_files.items():
-            sport_df = chunk[chunk['sport'] == sport]
-            if sport_df.empty:
-                continue
-
-            sport_df.to_csv(
-                filename,
-                mode='a',
-                header=not file_written[sport],
-                index=False
-            )
-            file_written[sport] = True
-            counts[sport] += len(sport_df)
+    df = pd.read_parquet(trades_file)
+    df['sport'] = df['sport'].astype(str).str.lower().str.strip()
 
     for sport, filename in sport_files.items():
-        count = counts[sport]
+        sport_df = df[df['sport'] == sport]
+        count = len(sport_df)
         if count > 0:
+            sport_df.to_parquet(filename, index=False, engine="pyarrow")
             print(f"  {sport.upper()}: {count:,} trades -> {filename}")
             logger.info(f"Saved {count} {sport.upper()} trades to {filename}")
         else:
+            # Remove stale file if it exists
+            if os.path.isfile(filename):
+                os.remove(filename)
             print(f"  {sport.upper()}: 0 trades (skipped)")
+
+
+def migrate_csv_to_parquet():
+    """
+    One-time migration utility: converts existing CSV files to Parquet.
+
+    Converts:
+        - db_markets.csv -> db_markets.parquet
+        - db_trades.csv -> db_trades.parquet
+        - db_trades_{sport}.csv -> db_trades_{sport}.parquet
+    """
+    import update_markets  # for coerce_bool
+
+    csv_files = {
+        "db_markets.csv": "db_markets.parquet",
+        "db_trades.csv": "db_trades.parquet",
+        "db_trades_nfl.csv": "db_trades_nfl.parquet",
+        "db_trades_nba.csv": "db_trades_nba.parquet",
+        "db_trades_cfb.csv": "db_trades_cfb.parquet",
+        "db_trades_cbb.csv": "db_trades_cbb.parquet",
+    }
+
+    for csv_path, parquet_path in csv_files.items():
+        if not os.path.isfile(csv_path):
+            continue
+
+        print(f"Migrating {csv_path} -> {parquet_path}...")
+        try:
+            df = pd.read_csv(csv_path, low_memory=False)
+
+            # Coerce types for trade files
+            if "is_correct_pick" in df.columns:
+                from utils.shared_utils import normalize_is_correct
+                df["is_correct_pick"] = df["is_correct_pick"].apply(normalize_is_correct)
+                df["is_correct_pick"] = df["is_correct_pick"].map(
+                    {True: True, False: False, None: pd.NA}
+                ).astype(pd.BooleanDtype())
+
+            if "is_resolved" in df.columns:
+                df["is_resolved"] = df["is_resolved"].apply(_coerce_bool)
+
+            if "game_start_time" in df.columns:
+                df["game_start_time"] = pd.to_datetime(df["game_start_time"], errors="coerce")
+
+            # Coerce numeric columns
+            numeric_cols = [
+                "yes_current_holdings", "yes_avg_price", "yes_total_bought",
+                "yes_current_price", "yes_realized_pnl", "yes_unrealized_pnl",
+                "yes_total_pnl", "no_current_holdings", "no_avg_price",
+                "no_total_bought", "no_current_price", "no_realized_pnl",
+                "no_unrealized_pnl", "no_total_pnl", "total_realized_pnl",
+                "total_unrealized_pnl", "total_pnl",
+            ]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(
+                        df[col].astype(str).str.replace(",", ""), errors="coerce"
+                    )
+
+            df.to_parquet(parquet_path, index=False, engine="pyarrow")
+            print(f"  OK: {len(df):,} rows")
+        except Exception as e:
+            print(f"  FAILED: {e}")
+
+    print("Migration complete.")
 
 
 if __name__ == "__main__":
@@ -1578,6 +1587,11 @@ if __name__ == "__main__":
         # CLI mode: Parse command-line arguments
         parser = argparse.ArgumentParser(
             description="Calculate PNL for users in Polymarket sports markets"
+        )
+        parser.add_argument(
+            "--migrate",
+            action="store_true",
+            help="Migrate existing CSV files to Parquet format"
         )
         parser.add_argument(
             "--resolved-only",
@@ -1621,6 +1635,10 @@ if __name__ == "__main__":
         )
 
         args = parser.parse_args()
+
+        if args.migrate:
+            migrate_csv_to_parquet()
+            exit(0)
 
         # Determine market filter based on flags
         if args.resolved_only and args.unresolved_only:

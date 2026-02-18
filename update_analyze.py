@@ -17,7 +17,6 @@ from utils.shared_utils import (
     MIN_GAMES_FOR_WIN_PCT,
     MIN_GAMES,
     MIN_WINS,
-    normalize_is_correct,
     coerce_numeric_series,
     parse_game_teams,
     get_season,
@@ -45,7 +44,7 @@ WRITE_PROGRESS_THRESHOLD = 2000
 # =============================================================================
 
 def load_and_transform(
-    input_csv: str,
+    input_file: str,
     late_pick_threshold: float = LATE_PICK_THRESHOLD,
     min_win_pct: float = MIN_WIN_PCT,
     min_games_for_win_pct: int = MIN_GAMES_FOR_WIN_PCT,
@@ -53,25 +52,23 @@ def load_and_transform(
     min_wins: int = MIN_WINS,
 ) -> pd.DataFrame:
     """
-    Load CSV and transform to expected format.
+    Load trade data from Parquet and transform to expected format.
 
     Similar to update_picks.py but with additional filters for min games/wins.
     """
-    df = pd.read_csv(input_csv)
-    print(f"Load: {input_csv} ({len(df):,} rows)")
+    df = pd.read_parquet(input_file)
+    print(f"Load: {input_file} ({len(df):,} rows)")
 
-    # Extract game_date from game_start_time
-    df['game_date'] = df['game_start_time'].str[:10]
+    # Extract game_date from game_start_time (native datetime from Parquet)
+    df['game_date'] = df['game_start_time'].dt.strftime('%Y-%m-%d')
 
     # Create unique game identifier
     df['game'] = df['match_title'] + ' (' + df['game_date'] + ')'
 
-    # Normalize is_correct_pick using shared function
-    normalized = df['is_correct_pick'].apply(normalize_is_correct)
-    df['is_correct_pick'] = normalized
-    df['result'] = normalized.map({True: 'won', False: 'lost'}).fillna('pending')
+    # Map is_correct_pick to result (already nullable bool from Parquet)
+    df['result'] = df['is_correct_pick'].map({True: 'won', False: 'lost'}).fillna('pending')
 
-    # Coerce price columns to numeric (remove commas if present)
+    # Coerce price columns to numeric (safe no-op for Parquet data)
     df['yes_avg_price'] = coerce_numeric_series(df.get('yes_avg_price'))
     df['no_avg_price'] = coerce_numeric_series(df.get('no_avg_price'))
 
@@ -597,22 +594,22 @@ def do_generate(
 ):
     """Main generation function."""
     if sport.lower() == "all":
-        input_csv = "db_trades.csv"
+        input_file = "db_trades.parquet"
         season_label = str(datetime.now().year)
     else:
         config = SPORTS_CONFIG[sport]
-        input_csv = config["input_csv"]
+        input_file = config["input_file"]
         season = get_season(sport, season_id)
         season_id = season["season_id"]
         season_label = season["label"]
 
-    if not os.path.exists(input_csv):
-        print(f"Input file not found: {input_csv}")
+    if not os.path.exists(input_file):
+        print(f"Input file not found: {input_file}")
         return
 
     # Load and transform data
     df = load_and_transform(
-        input_csv,
+        input_file,
         late_pick_threshold=late_pick_threshold,
         min_win_pct=min_win_pct,
         min_games_for_win_pct=min_games_for_win_pct,

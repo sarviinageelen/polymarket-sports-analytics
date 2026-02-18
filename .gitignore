@@ -28,11 +28,15 @@ logs/
 # Cache files
 .cache_performance_*.pkl
 
-# Data files (generated - exclude large CSVs)
+# Data files (generated - exclude large CSVs and Parquet)
 *.csv
+*.parquet
 db_markets.csv
+db_markets.parquet
 db_trades.csv
+db_trades.parquet
 db_trades_*.csv
+db_trades_*.parquet
 output_picks_*.csv
 
 # OS files

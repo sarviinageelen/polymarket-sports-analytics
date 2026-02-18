@@ -101,37 +101,17 @@ class TestGetOutputFilename:
 class TestLoadAndTransform:
     """Test load_and_transform function."""
 
-    def test_string_is_correct_pick_values(self, tmp_path):
-        # User needs >= 3 games and >= 3 wins to pass the filters
-        df = pd.DataFrame({
-            "game_start_time": [
-                "2025-09-10 12:00:00",
-                "2025-09-10 13:00:00",
-                "2025-09-10 14:00:00",
-                "2025-09-10 15:00:00",
-                "2025-09-10 16:00:00",
-            ],
-            "match_title": [
-                "Chiefs vs Raiders",
-                "Bills vs Dolphins",
-                "Cowboys vs Eagles",
-                "Packers vs Bears",
-                "49ers vs Seahawks",
-            ],
-            "is_correct_pick": ["TRUE", "TRUE", "TRUE", "FALSE", ""],
-            "user_pick": ["Chiefs", "Bills", "Cowboys", "Bears", "49ers"],
-            "yes_avg_price": [0.5, 0.5, 0.5, 0.4, 0.5],
-            "no_avg_price": [0.4, 0.4, 0.4, 0.5, 0.4],
-            "user_address": ["0x1", "0x1", "0x1", "0x1", "0x1"],
-        })
-
-        csv_path = tmp_path / "trades.csv"
-        df.to_csv(csv_path, index=False)
-
-        result = load_and_transform(str(csv_path))
-
-        # User has 3 wins, 1 loss, 1 pending (5 games total, 3 wins = passes filters)
-        assert result["result"].tolist() == ["won", "won", "won", "lost", "pending"]
+    def _make_parquet(self, tmp_path, df):
+        """Helper to write a DataFrame as Parquet with proper types."""
+        df["game_start_time"] = pd.to_datetime(df["game_start_time"])
+        # Convert is_correct_pick to nullable boolean
+        if "is_correct_pick" in df.columns:
+            df["is_correct_pick"] = df["is_correct_pick"].map(
+                {True: True, False: False, "TRUE": True, "FALSE": False, "": pd.NA}
+            ).astype(pd.BooleanDtype())
+        path = tmp_path / "trades.parquet"
+        df.to_parquet(path, index=False, engine="pyarrow")
+        return str(path)
 
     def test_boolean_is_correct_pick_values(self, tmp_path):
         # User needs >= 3 games and >= 3 wins to pass the filters
@@ -155,26 +135,59 @@ class TestLoadAndTransform:
             "user_address": ["0x1", "0x1", "0x1", "0x1"],
         })
 
-        csv_path = tmp_path / "trades.csv"
-        df.to_csv(csv_path, index=False)
-
-        result = load_and_transform(str(csv_path))
+        parquet_path = self._make_parquet(tmp_path, df)
+        result = load_and_transform(parquet_path)
 
         # User has 3 wins, 1 loss (4 games total, 3 wins = passes filters)
         assert result["result"].tolist() == ["won", "won", "won", "lost"]
 
+    def test_pending_picks(self, tmp_path):
+        # User needs >= 3 games and >= 3 wins to pass the filters
+        df = pd.DataFrame({
+            "game_start_time": [
+                "2025-09-10 12:00:00",
+                "2025-09-10 13:00:00",
+                "2025-09-10 14:00:00",
+                "2025-09-10 15:00:00",
+                "2025-09-10 16:00:00",
+            ],
+            "match_title": [
+                "Chiefs vs Raiders",
+                "Bills vs Dolphins",
+                "Cowboys vs Eagles",
+                "Packers vs Bears",
+                "49ers vs Seahawks",
+            ],
+            "is_correct_pick": [True, True, True, False, pd.NA],
+            "user_pick": ["Chiefs", "Bills", "Cowboys", "Bears", "49ers"],
+            "yes_avg_price": [0.5, 0.5, 0.5, 0.4, 0.5],
+            "no_avg_price": [0.4, 0.4, 0.4, 0.5, 0.4],
+            "user_address": ["0x1", "0x1", "0x1", "0x1", "0x1"],
+        })
+
+        # Build parquet with nullable boolean
+        df["game_start_time"] = pd.to_datetime(df["game_start_time"])
+        df["is_correct_pick"] = df["is_correct_pick"].astype(pd.BooleanDtype())
+        path = tmp_path / "trades.parquet"
+        df.to_parquet(path, index=False, engine="pyarrow")
+
+        result = load_and_transform(str(path))
+
+        # User has 3 wins, 1 loss, 1 pending (5 games total, 3 wins = passes filters)
+        assert result["result"].tolist() == ["won", "won", "won", "lost", "pending"]
+
     def test_missing_columns_raises_error(self, tmp_path):
         df = pd.DataFrame({
-            "game_start_time": ["2025-09-10 12:00:00"],
+            "game_start_time": pd.to_datetime(["2025-09-10 12:00:00"]),
             "match_title": ["Chiefs vs Raiders"],
             # Missing other required columns
         })
 
-        csv_path = tmp_path / "trades.csv"
-        df.to_csv(csv_path, index=False)
+        path = tmp_path / "trades.parquet"
+        df.to_parquet(path, index=False, engine="pyarrow")
 
         with pytest.raises(ValueError, match="Missing required columns"):
-            load_and_transform(str(csv_path))
+            load_and_transform(str(path))
 
     def test_late_picks_filtered(self, tmp_path):
         # User 0x1 has 4 games with 3 wins (passes filters)
@@ -194,17 +207,15 @@ class TestLoadAndTransform:
                 "Packers vs Bears",
                 "49ers vs Seahawks",
             ],
-            "is_correct_pick": ["TRUE", "TRUE", "TRUE", "FALSE", "TRUE"],
+            "is_correct_pick": [True, True, True, False, True],
             "user_pick": ["Chiefs", "Bills", "Cowboys", "Bears", "49ers"],
             "yes_avg_price": [0.5, 0.5, 0.5, 0.4, 0.96],  # Last pick is late (>= 0.95)
             "no_avg_price": [0.4, 0.4, 0.4, 0.5, 0.04],
             "user_address": ["0x1", "0x1", "0x1", "0x1", "0x2"],
         })
 
-        csv_path = tmp_path / "trades.csv"
-        df.to_csv(csv_path, index=False)
-
-        result = load_and_transform(str(csv_path))
+        parquet_path = self._make_parquet(tmp_path, df)
+        result = load_and_transform(parquet_path)
 
         # User 0x1 has 4 picks remaining (3 wins, 1 loss = passes filters)
         # User 0x2's late pick was filtered, then user 0x2 was filtered (< 3 games)
@@ -260,7 +271,7 @@ class TestSportsConfig:
 
     def test_required_fields(self):
         for sport, config in SPORTS_CONFIG.items():
-            assert "input_csv" in config, f"{sport} missing input_csv"
+            assert "input_file" in config, f"{sport} missing input_file"
             assert "seasons" in config, f"{sport} missing seasons"
             assert isinstance(config["seasons"], list), f"{sport} seasons must be a list"
             assert len(config["seasons"]) > 0, f"{sport} has no season entries"
@@ -272,7 +283,22 @@ class TestSportsConfig:
                 assert "regular_weeks" in season, f"{sport} season missing regular_weeks"
                 assert "end_date" in season, f"{sport} season missing end_date"
 
+    def test_input_file_is_parquet(self):
+        for sport, config in SPORTS_CONFIG.items():
+            assert config["input_file"].endswith(".parquet"), \
+                f"{sport} input_file should be .parquet, got {config['input_file']}"
+
     def test_get_seasons_returns_sorted(self):
         seasons = get_seasons("NFL")
         assert len(seasons) >= 1
         assert seasons[0]["start_date"] >= seasons[-1]["start_date"]
+
+    def test_historical_seasons_present(self):
+        for sport in ["NFL", "CFB"]:
+            ids = [s["season_id"] for s in get_seasons(sport)]
+            assert "2022" in ids
+            assert "2023" in ids
+        for sport in ["NBA", "CBB"]:
+            ids = [s["season_id"] for s in get_seasons(sport)]
+            assert "2022-23" in ids
+            assert "2023-24" in ids

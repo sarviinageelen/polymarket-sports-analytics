@@ -11,7 +11,7 @@ Data Source:
     - Filters to moneyline markets only (excludes spreads, totals, props)
 
 Output:
-    - db_markets.csv: Database of all moneyline markets with columns:
+    - db_markets.parquet: Database of all moneyline markets with columns:
         - sport: Sport league (NFL, CFB, NBA)
         - condition_id: Unique market identifier for Polymarket
         - match_title: Game title (e.g., "Chiefs vs Raiders")
@@ -26,7 +26,6 @@ Usage:
 
 Configuration:
     - SERIES_IDS: Maps Polymarket series IDs to sport names
-    - MIN_YEAR: Filters out historical seasons (default: 2025)
     - WINNER_PRICE_THRESHOLD: Price threshold to determine winner (>0.95)
 
 API Rate Limits:
@@ -69,7 +68,7 @@ logger = setup_logging()
 # ------------------------------------------------------------------------------
 
 # Output file path for market database
-CSV_PATH = "db_markets.csv"
+PARQUET_PATH = "db_markets.parquet"
 
 # Polymarket Gamma API endpoints
 # - /sports: List of available sports with series IDs
@@ -92,10 +91,6 @@ SERIES_IDS = {
 
 # Maximum events to fetch per API request (Gamma API pagination limit)
 PAGE_LIMIT = 500
-
-# Filter out events from previous seasons
-# Only fetch events created in this year or later
-MIN_YEAR = 2025
 
 # Price threshold for determining market resolution
 # When an outcome's price exceeds this, consider it the winner
@@ -524,9 +519,8 @@ def process_events(events, sport, series):
     """
     Process a batch of events and extract all valid moneyline markets.
     
-    Iterates through events, filters by creation date (MIN_YEAR onwards),
-    and extracts moneyline markets from each event. Shows progress for
-    large batches.
+    Iterates through events and extracts moneyline markets from each event.
+    Shows progress for large batches.
     
     Args:
         events: List of event dicts from fetch_events_for_series()
@@ -544,18 +538,6 @@ def process_events(events, sport, series):
     total_events = len(events)
 
     for idx, event in enumerate(events, 1):
-        # Filter by creation date (must be in MIN_YEAR or later)
-        creation_date_str = event.get('creationDate')
-        if not creation_date_str:
-            continue
-
-        try:
-            creation_date = pd.to_datetime(creation_date_str)
-            if creation_date.year < MIN_YEAR:
-                continue
-        except (ValueError, TypeError):
-            continue
-
         # Process each market in the event
         for market in event.get('markets', []):
             market_row = process_market(market, event, sport, series)
@@ -585,12 +567,12 @@ def main():
     1. Fetches available sports matching target series IDs
     2. For each sport, fetches all events via Gamma API
     3. Processes events to extract moneyline markets
-    4. Saves results to db_markets.csv sorted by game time
+    4. Saves results to db_markets.parquet sorted by game time
     
-    Output file (CSV_PATH):
+    Output file (PARQUET_PATH):
         Contains all moneyline markets with columns for sport,
         teams, game time, resolution status, and Polymarket IDs.
-        game_start_time is formatted as 'YYYY-MM-DD HH:MM:SS' for Excel.
+        game_start_time is stored as native datetime64 in Parquet.
     
     Console output:
         Progress updates for each sport showing event and market counts.
@@ -665,15 +647,11 @@ def main():
     # Final sort by game time (most recent first)
     df = df.sort_values('game_start_time', ascending=False)
 
-    # Format game_start_time for Excel date recognition
-    # Handle NaT values to avoid 'NaT' strings in output
-    df['game_start_time'] = df['game_start_time'].dt.strftime('%Y-%m-%d %H:%M:%S').fillna('')
+    df.to_parquet(PARQUET_PATH, index=False, engine='pyarrow')
 
-    df.to_csv(CSV_PATH, index=False)
-    
-    logger.info(f"Saved {len(df)} markets to {CSV_PATH}")
+    logger.info(f"Saved {len(df)} markets to {PARQUET_PATH}")
     print(f"Total: {len(df)} markets")
-    print(f"Saved to {CSV_PATH}")
+    print(f"Saved to {PARQUET_PATH}")
 
 
 if __name__ == "__main__":

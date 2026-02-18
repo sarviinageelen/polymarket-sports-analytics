@@ -98,19 +98,19 @@ class TestDetermineUserPick:
 
 class TestCalculateIsCorrectPick:
     def test_correct_pick(self):
-        assert calculate_is_correct_pick("Chiefs", "Chiefs") == "TRUE"
-    
+        assert calculate_is_correct_pick("Chiefs", "Chiefs") is True
+
     def test_incorrect_pick(self):
-        assert calculate_is_correct_pick("Chiefs", "Raiders") == "FALSE"
-    
+        assert calculate_is_correct_pick("Chiefs", "Raiders") is False
+
     def test_no_pick(self):
-        assert calculate_is_correct_pick("NONE", "Chiefs") == ""
-    
+        assert calculate_is_correct_pick("NONE", "Chiefs") is None
+
     def test_pending_outcome(self):
-        assert calculate_is_correct_pick("Chiefs", "Pending") == ""
-    
+        assert calculate_is_correct_pick("Chiefs", "Pending") is None
+
     def test_empty_pick(self):
-        assert calculate_is_correct_pick("", "Chiefs") == ""
+        assert calculate_is_correct_pick("", "Chiefs") is None
 
 
 class TestFormatNumber:
